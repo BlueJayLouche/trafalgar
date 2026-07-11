@@ -6,7 +6,7 @@
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod editor;
@@ -78,6 +78,12 @@ pub(crate) struct TrackParams {
     pub percussive: BoolParam,
     #[id = "note"]
     pub note: IntParam,
+    /// Armed: touching the pad writes the pitch into the loop at the playhead.
+    #[id = "record"]
+    pub record: BoolParam,
+    /// On: wipes the recorded loop as the playhead passes (Figure-style erase).
+    #[id = "erase"]
+    pub erase: BoolParam,
 }
 
 impl Default for TrackParams {
@@ -92,6 +98,8 @@ impl Default for TrackParams {
             hold: BoolParam::new("Hold", true),
             percussive: BoolParam::new("Percussive", false),
             note: IntParam::new("Drum Note", 36, IntRange::Linear { min: 0, max: 127 }),
+            record: BoolParam::new("Record", false),
+            erase: BoolParam::new("Erase", false),
         }
     }
 }
@@ -124,6 +132,9 @@ pub(crate) struct Shared {
     pub pos: [AtomicU64; NUM_TRACKS],
     /// Current playhead step per track (audio -> GUI); -1 = idle.
     pub step: [AtomicI64; NUM_TRACKS],
+    /// Recorded gesture: pitch degree per step, per track. -1 = empty. Owned by the
+    /// audio thread (record/erase/playback), read by the GUI to draw the loop.
+    pub gesture: [[AtomicI32; STEPS]; NUM_TRACKS],
 }
 
 pub struct Trafalgar {
@@ -143,6 +154,7 @@ impl Default for Trafalgar {
                 gate: std::array::from_fn(|_| AtomicBool::new(false)),
                 pos: std::array::from_fn(|_| AtomicU64::new(0)),
                 step: std::array::from_fn(|_| AtomicI64::new(-1)),
+                gesture: std::array::from_fn(|_| std::array::from_fn(|_| AtomicI32::new(-1))),
             }),
             last_step: [-1; NUM_TRACKS],
             playing_note: [None; NUM_TRACKS],
@@ -235,7 +247,7 @@ impl Plugin for Trafalgar {
             // atomic (no event-queue lag) so the first note lands at the clicked
             // position; otherwise use the params (preserves host automation + latch).
             let touching = self.shared.gate[tr].load(Ordering::Acquire);
-            let (pitch_deg, density) = if touching {
+            let (live_pitch, density) = if touching {
                 let packed = self.shared.pos[tr].load(Ordering::Relaxed);
                 let nx = f32::from_bits((packed >> 32) as u32);
                 let dnorm = f32::from_bits(packed as u32);
@@ -247,8 +259,12 @@ impl Plugin for Trafalgar {
                 (p.pitch.value(), p.density.value() as usize)
             };
 
-            // Hold on => always sound; Hold off => only while the pad is dragged.
-            let gate_open = p.hold.value() || touching;
+            let record = p.record.value();
+            let erase = p.erase.value();
+            let has_rec = self.shared.gesture[tr].iter().any(|c| c.load(Ordering::Relaxed) >= 0);
+
+            // Sound if Hold is on, the pad is touched, or a loop is recorded.
+            let gate_open = p.hold.value() || touching || has_rec;
             if !playing || !gate_open {
                 if let Some(n) = self.playing_note[tr].take() {
                     context.send_event(NoteEvent::NoteOff { timing: 0, voice_id: None, channel: tr as u8, note: n, velocity: 0.0 });
@@ -276,6 +292,25 @@ impl Plugin for Trafalgar {
                 }
 
                 let idx = stp.rem_euclid(STEPS as i64) as usize;
+
+                // Record / erase / read the gesture loop at this step.
+                let cell = &self.shared.gesture[tr][idx];
+                if erase {
+                    cell.store(-1, Ordering::Relaxed);
+                } else if record && touching {
+                    cell.store(live_pitch, Ordering::Relaxed);
+                }
+                let recorded = cell.load(Ordering::Relaxed);
+
+                // Pitch for this step: live touch wins, else the recorded loop, else the param.
+                let pitch_deg = if touching {
+                    live_pitch
+                } else if recorded >= 0 {
+                    recorded
+                } else {
+                    p.pitch.value()
+                };
+
                 if pattern[idx] {
                     // Melodic: scale pitch, always fires. Percussive: fixed note, X = probability.
                     let (note, fire) = if p.percussive.value() {

@@ -67,8 +67,18 @@ fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared
             .width(Pixels(150.0))
             .height(Pixels(150.0));
 
-        ParamButton::new(cx, Data::params, move |p| &p.tracks[i].hold);
-        ParamButton::new(cx, Data::params, move |p| &p.tracks[i].percussive);
+        HStack::new(cx, |cx| {
+            ParamButton::new(cx, Data::params, move |p| &p.tracks[i].hold);
+            ParamButton::new(cx, Data::params, move |p| &p.tracks[i].percussive);
+        })
+        .col_between(Pixels(4.0))
+        .height(Auto);
+        HStack::new(cx, |cx| {
+            ParamButton::new(cx, Data::params, move |p| &p.tracks[i].record);
+            ParamButton::new(cx, Data::params, move |p| &p.tracks[i].erase);
+        })
+        .col_between(Pixels(4.0))
+        .height(Auto);
         slider_row(cx, "Rot", move |p| &p.tracks[i].rotation);
         slider_row(cx, "Accent", move |p| &p.tracks[i].accent);
         slider_row(cx, "Vel", move |p| &p.tracks[i].base_vel);
@@ -234,5 +244,19 @@ impl View for XyPad {
         let mut ring = vg::Path::new();
         ring.circle(px, py, 7.0);
         canvas.stroke_path(&ring, &vg::Paint::color(accent_col).with_line_width(2.0));
+
+        // recorded gesture loop: a green dot per step, height = recorded pitch
+        let rec_col = vg::Color::rgb(90, 210, 140);
+        for s in 0..STEPS {
+            let v = self.shared.gesture[self.track][s].load(Ordering::Relaxed);
+            if v < 0 {
+                continue;
+            }
+            let gx = b.x + b.w * (s as f32 + 0.5) / STEPS as f32;
+            let gy = b.y + (1.0 - v as f32 / PITCH_RANGE as f32) * b.h;
+            let mut d = vg::Path::new();
+            d.circle(gx, gy, 3.0);
+            canvas.fill_path(&d, &vg::Paint::color(rec_col));
+        }
     }
 }
