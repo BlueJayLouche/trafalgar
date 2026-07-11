@@ -3622,6 +3622,7 @@ dependencies = [
 name = "trafalgar"
 version = "0.1.0"
 dependencies = [
+ "cpal",
  "nih_plug",
  "nih_plug_vizia",
  "rosc",
