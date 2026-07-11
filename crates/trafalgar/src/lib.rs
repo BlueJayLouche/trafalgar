@@ -36,6 +36,16 @@ pub(crate) fn rotated(pulses: usize, steps: usize, rot: usize) -> Vec<bool> {
     (0..steps).map(|i| base[(i + steps - r) % steps]).collect()
 }
 
+/// Tiny xorshift64 -> [0, 1). ponytail: a real RNG crate is overkill for hit dice.
+fn xorshift(state: &mut u64) -> f32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    (x >> 40) as f32 / (1u64 << 24) as f32
+}
+
 /// Map a scale degree onto a MIDI note in the minor pentatonic.
 fn scale_note(degree: u8) -> u8 {
     let oct = (degree / PENTATONIC.len() as u8) as i32;
@@ -61,6 +71,11 @@ struct TrafalgarParams {
     /// Hold on = latched/continuous. Hold off = only sounds while dragging the pad.
     #[id = "hold"]
     hold: BoolParam,
+    /// Percussive: fixed drum note, X axis = hit probability. Melodic: X = scale pitch.
+    #[id = "perc"]
+    percussive: BoolParam,
+    #[id = "note"]
+    note: IntParam,
 
     #[persist = "editor-state"]
     editor_state: Arc<ViziaState>,
@@ -76,6 +91,8 @@ impl Default for TrafalgarParams {
             base_vel: FloatParam::new("Velocity", 0.7, FloatRange::Linear { min: 0.0, max: 1.0 }),
             accent_vel: FloatParam::new("Accent Level", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 }),
             hold: BoolParam::new("Hold", true),
+            percussive: BoolParam::new("Percussive", false),
+            note: IntParam::new("Drum Note", 36, IntRange::Linear { min: 0, max: 127 }),
             editor_state: editor::default_state(),
         }
     }
@@ -89,6 +106,7 @@ pub struct Trafalgar {
     step: Arc<AtomicI64>,
     last_step: i64,           // last step index emitted; -1 = none
     playing_note: Option<u8>, // currently sounding note (monophonic, this slice)
+    rng: u64,                 // xorshift state for percussive hit probability
 }
 
 impl Default for Trafalgar {
@@ -99,6 +117,7 @@ impl Default for Trafalgar {
             step: Arc::new(AtomicI64::new(-1)),
             last_step: -1,
             playing_note: None,
+            rng: 0x9E37_79B9_7F4A_7C15,
         }
     }
 }
@@ -199,14 +218,22 @@ impl Plugin for Trafalgar {
             }
             let idx = step.rem_euclid(STEPS as i64) as usize;
             if pattern[idx] {
-                let note = scale_note(self.params.pitch.value() as u8);
-                let velocity = if accents[idx] {
-                    self.params.accent_vel.value()
+                // Melodic: scale pitch, always fires. Percussive: fixed note, X = probability.
+                let (note, fire) = if self.params.percussive.value() {
+                    let prob = self.params.pitch.value() as f32 / PITCH_RANGE as f32;
+                    (self.params.note.value() as u8, xorshift(&mut self.rng) < prob)
                 } else {
-                    self.params.base_vel.value()
+                    (scale_note(self.params.pitch.value() as u8), true)
                 };
-                context.send_event(NoteEvent::NoteOn { timing, voice_id: None, channel: 0, note, velocity });
-                self.playing_note = Some(note);
+                if fire {
+                    let velocity = if accents[idx] {
+                        self.params.accent_vel.value()
+                    } else {
+                        self.params.base_vel.value()
+                    };
+                    context.send_event(NoteEvent::NoteOn { timing, voice_id: None, channel: 0, note, velocity });
+                    self.playing_note = Some(note);
+                }
             }
         }
 
@@ -250,6 +277,14 @@ mod tests {
         assert!(rotated(4, 16, 1)[1]);
         assert!(rotated(4, 16, 15)[15]);
         assert_eq!(rotated(3, 8, 3).iter().filter(|&&b| b).count(), 3);
+    }
+    #[test]
+    fn xorshift_in_unit_range() {
+        let mut s = 1u64;
+        for _ in 0..1000 {
+            let v = xorshift(&mut s);
+            assert!((0.0..1.0).contains(&v), "{v} out of range");
+        }
     }
     #[test]
     fn pitch_in_range() {

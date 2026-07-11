@@ -50,7 +50,14 @@ pub fn create(
                 .width(Pixels(260.0))
                 .height(Pixels(260.0));
 
-            ParamButton::new(cx, Data::params, |p| &p.hold);
+            HStack::new(cx, |cx| {
+                ParamButton::new(cx, Data::params, |p| &p.hold);
+                ParamButton::new(cx, Data::params, |p| &p.percussive);
+            })
+            .col_between(Pixels(6.0))
+            .height(Auto);
+            Label::new(cx, "Drum note (percussive)");
+            ParamSlider::new(cx, Data::params, |p| &p.note);
             Label::new(cx, "Rotation");
             ParamSlider::new(cx, Data::params, |p| &p.rotation);
             Label::new(cx, "Accent");
