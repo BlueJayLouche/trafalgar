@@ -1,10 +1,10 @@
-// Vizia editor: the XY performance pad (X = pitch keybed, Y = density) plus stock
-// param sliders for rotation / accent / velocities. First real UI cut — one track.
-// The pad is the only custom widget; everything else is nih_plug_vizia's ParamSlider.
+// Vizia editor: the XY performance pad (X = pitch keybed, Y = density) with a live
+// euclidean step display, plus stock param widgets. One track for now. The pad is
+// the only custom widget; a 30fps timer drives redraws so the playhead animates.
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use nih_plug::prelude::Editor;
 use nih_plug_vizia::vizia::prelude::*;
@@ -13,7 +13,7 @@ use nih_plug_vizia::widgets::param_base::ParamWidgetBase;
 use nih_plug_vizia::widgets::{ParamButton, ParamSlider};
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 
-use crate::TrafalgarParams;
+use crate::{euclid, rotated, TrafalgarParams, PITCH_RANGE, STEPS};
 
 #[derive(Lens)]
 struct Data {
@@ -22,23 +22,31 @@ struct Data {
 impl Model for Data {}
 
 pub fn default_state() -> Arc<ViziaState> {
-    ViziaState::new(|| (300, 460))
+    ViziaState::new(|| (300, 480))
 }
 
 pub fn create(
     params: Arc<TrafalgarParams>,
     gate: Arc<AtomicBool>,
+    step: Arc<AtomicI64>,
     state: Arc<ViziaState>,
 ) -> Option<Box<dyn Editor>> {
     create_vizia_editor(state, ViziaTheming::Custom, move |cx, _| {
         assets::register_noto_sans_light(cx);
         Data { params: params.clone() }.build(cx);
 
-        let gate = gate.clone();
+        // ~30fps redraw so the euclidean step head animates.
+        let timer = cx.add_timer(Duration::from_millis(33), None, |cx, action| {
+            if matches!(action, TimerAction::Tick(_)) {
+                cx.needs_redraw();
+            }
+        });
+        cx.start_timer(timer);
+
         VStack::new(cx, |cx| {
             Label::new(cx, "TRAFALGAR").font_size(22.0).top(Pixels(4.0));
 
-            XyPad::new(cx, Data::params, gate.clone())
+            XyPad::new(cx, Data::params, params.clone(), gate.clone(), step.clone())
                 .width(Pixels(260.0))
                 .height(Pixels(260.0));
 
@@ -58,25 +66,34 @@ pub fn create(
 }
 
 /// Two-parameter performance pad. X drives pitch, Y drives density (up = denser).
+/// Draws the live euclidean pattern with the playhead and an accent ring.
 pub struct XyPad {
-    x: ParamWidgetBase, // pitch
-    y: ParamWidgetBase, // density
-    gate: Arc<AtomicBool>, // pad touch state -> audio thread
+    x: ParamWidgetBase,           // pitch (write)
+    y: ParamWidgetBase,           // density (write)
+    params: Arc<TrafalgarParams>, // read-only, for drawing
+    gate: Arc<AtomicBool>,        // pad touch state -> audio thread
+    step: Arc<AtomicI64>,         // playhead step from audio thread (-1 = idle)
     drag: bool,
-    pos: Cell<(f32, f32)>, // last normalized (x, y) for the crosshair
 }
 
 impl XyPad {
-    pub fn new<L>(cx: &mut Context, params: L, gate: Arc<AtomicBool>) -> Handle<Self>
+    pub fn new<L>(
+        cx: &mut Context,
+        lens: L,
+        params: Arc<TrafalgarParams>,
+        gate: Arc<AtomicBool>,
+        step: Arc<AtomicI64>,
+    ) -> Handle<Self>
     where
         L: Lens<Target = Arc<TrafalgarParams>> + Clone,
     {
         Self {
-            x: ParamWidgetBase::new(cx, params.clone(), |p| &p.pitch),
-            y: ParamWidgetBase::new(cx, params, |p| &p.density),
+            x: ParamWidgetBase::new(cx, lens.clone(), |p| &p.pitch),
+            y: ParamWidgetBase::new(cx, lens, |p| &p.density),
+            params,
             gate,
+            step,
             drag: false,
-            pos: Cell::new((0.33, 0.2)),
         }
         .build(cx, |_| {})
     }
@@ -88,7 +105,6 @@ impl XyPad {
         }
         let nx = ((mx - b.x) / b.w).clamp(0.0, 1.0);
         let ny = ((my - b.y) / b.h).clamp(0.0, 1.0);
-        self.pos.set((nx, ny));
         self.x.set_normalized_value(cx, nx); // X = pitch
         self.y.set_normalized_value(cx, 1.0 - ny); // Y up = denser
     }
@@ -136,11 +152,42 @@ impl View for XyPad {
             return;
         }
 
+        // background
         let mut bg = vg::Path::new();
         bg.rect(b.x, b.y, b.w, b.h);
         canvas.fill_path(&bg, &vg::Paint::color(vg::Color::rgb(24, 24, 28)));
 
-        let (nx, ny) = self.pos.get();
+        // live euclidean pattern along the bottom
+        let density = self.params.density.value() as usize;
+        let rotation = self.params.rotation.value() as usize;
+        let pattern = rotated(density, STEPS, rotation);
+        let accents = euclid(self.params.accent.value() as usize, STEPS);
+        let cur = self.step.load(Ordering::Relaxed);
+        let accent_col = vg::Color::rgb(255, 120, 80);
+        for s in 0..STEPS {
+            let x = b.x + b.w * (s as f32 + 0.5) / STEPS as f32;
+            let y = b.bottom() - 16.0;
+            let is_cur = cur == s as i64;
+            let (r, col) = match (pattern[s], is_cur) {
+                (true, true) => (7.0, accent_col),
+                (true, false) => (5.0, vg::Color::rgb(200, 200, 200)),
+                (false, true) => (5.0, vg::Color::rgb(120, 60, 40)),
+                (false, false) => (3.0, vg::Color::rgb(70, 70, 70)),
+            };
+            let mut dot = vg::Path::new();
+            dot.circle(x, y, r);
+            canvas.fill_path(&dot, &vg::Paint::color(col));
+            // accent ring on accented onsets
+            if pattern[s] && accents[s] {
+                let mut ring = vg::Path::new();
+                ring.circle(x, y, r + 3.0);
+                canvas.stroke_path(&ring, &vg::Paint::color(accent_col).with_line_width(1.5));
+            }
+        }
+
+        // crosshair derived from the actual pitch/density params (tracks automation)
+        let nx = self.params.pitch.value() as f32 / PITCH_RANGE as f32;
+        let ny = 1.0 - (self.params.density.value() - 1) as f32 / (STEPS as f32 - 1.0);
         let px = b.x + nx * b.w;
         let py = b.y + ny * b.h;
 
@@ -154,11 +201,8 @@ impl View for XyPad {
             &vg::Paint::color(vg::Color::rgb(70, 70, 80)).with_line_width(1.0),
         );
 
-        let mut dot = vg::Path::new();
-        dot.circle(px, py, 8.0);
-        canvas.stroke_path(
-            &dot,
-            &vg::Paint::color(vg::Color::rgb(255, 120, 80)).with_line_width(2.0),
-        );
+        let mut ring = vg::Path::new();
+        ring.circle(px, py, 8.0);
+        canvas.stroke_path(&ring, &vg::Paint::color(accent_col).with_line_width(2.0));
     }
 }

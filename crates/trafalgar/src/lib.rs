@@ -6,19 +6,19 @@
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 mod editor;
 
-const STEPS: usize = 16;
+pub(crate) const STEPS: usize = 16;
 const BASE_NOTE: u8 = 48; // C3
-const PITCH_RANGE: i32 = 15; // scale degrees the pitch param spans
+pub(crate) const PITCH_RANGE: i32 = 15; // scale degrees the pitch param spans
 const PENTATONIC: [u8; 5] = [0, 3, 5, 7, 10]; // minor pentatonic
 
 /// Bjorklund (Bresenham form): `pulses` onsets spread evenly over `steps`,
 /// onset on step 0. `(i*pulses) % steps < pulses`.
-fn euclid(pulses: usize, steps: usize) -> Vec<bool> {
+pub(crate) fn euclid(pulses: usize, steps: usize) -> Vec<bool> {
     if steps == 0 {
         return vec![];
     }
@@ -27,7 +27,7 @@ fn euclid(pulses: usize, steps: usize) -> Vec<bool> {
 }
 
 /// Euclidean pattern rotated right by `rot` steps (rot=0 => onset on step 0).
-fn rotated(pulses: usize, steps: usize, rot: usize) -> Vec<bool> {
+pub(crate) fn rotated(pulses: usize, steps: usize, rot: usize) -> Vec<bool> {
     if steps == 0 {
         return vec![];
     }
@@ -85,6 +85,8 @@ pub struct Trafalgar {
     params: Arc<TrafalgarParams>,
     /// Pad touch state, shared GUI -> audio. Gates notes when Hold is off.
     gate: Arc<AtomicBool>,
+    /// Current playhead step, shared audio -> GUI for the step display. -1 = idle.
+    step: Arc<AtomicI64>,
     last_step: i64,           // last step index emitted; -1 = none
     playing_note: Option<u8>, // currently sounding note (monophonic, this slice)
 }
@@ -94,6 +96,7 @@ impl Default for Trafalgar {
         Self {
             params: Arc::new(TrafalgarParams::default()),
             gate: Arc::new(AtomicBool::new(false)),
+            step: Arc::new(AtomicI64::new(-1)),
             last_step: -1,
             playing_note: None,
         }
@@ -127,7 +130,12 @@ impl Plugin for Trafalgar {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(self.params.clone(), self.gate.clone(), self.params.editor_state.clone())
+        editor::create(
+            self.params.clone(),
+            self.gate.clone(),
+            self.step.clone(),
+            self.params.editor_state.clone(),
+        )
     }
 
     fn reset(&mut self) {
@@ -165,6 +173,7 @@ impl Plugin for Trafalgar {
                 context.send_event(NoteEvent::NoteOff { timing: 0, voice_id: None, channel: 0, note: n, velocity: 0.0 });
             }
             self.last_step = -1;
+            self.step.store(-1, Ordering::Relaxed);
             return ProcessStatus::Normal;
         }
 
@@ -201,6 +210,7 @@ impl Plugin for Trafalgar {
             }
         }
 
+        self.step.store(self.last_step.rem_euclid(STEPS as i64), Ordering::Relaxed);
         ProcessStatus::Normal
     }
 }
