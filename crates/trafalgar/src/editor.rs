@@ -300,7 +300,7 @@ impl View for XyPad {
                 continue;
             }
             let gx = b.x + b.w * (s as f32 + 0.5) / loop_steps as f32;
-            let gy = b.y + (1.0 - v as f32 / PITCH_RANGE as f32) * b.h;
+            let gy = b.y + (1.0 - v as f32 / 127.0) * b.h; // v is a MIDI note (0..127)
             let (r, col) = if gcur == s as i64 { (4.0, rec_cur) } else { (3.0, rec_col) };
             let mut d = vg::Path::new();
             d.circle(gx, gy, r);

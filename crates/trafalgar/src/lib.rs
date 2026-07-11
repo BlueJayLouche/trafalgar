@@ -267,9 +267,10 @@ impl Plugin for Trafalgar {
             let record = p.record.value();
             let erase = self.shared.erase[tr].load(Ordering::Relaxed);
             let loop_steps = p.length.value() as usize * STEPS;
+            // A cell is -1 empty, -2 a recorded rest, or 0..=127 a recorded note.
             let has_rec = self.shared.gesture[tr][..loop_steps]
                 .iter()
-                .any(|c| c.load(Ordering::Relaxed) >= 0);
+                .any(|c| c.load(Ordering::Relaxed) != -1);
 
             // Sound if Hold is on, the pad is touched, or a loop is recorded.
             let gate_open = p.hold.value() || touching || has_rec;
@@ -302,40 +303,49 @@ impl Plugin for Trafalgar {
                 let idx = stp.rem_euclid(STEPS as i64) as usize; // euclidean pattern (per bar)
                 let gidx = stp.rem_euclid(loop_steps as i64) as usize; // gesture loop position
 
-                // Record / erase / read the gesture loop at this step.
                 let cell = &self.shared.gesture[tr][gidx];
                 if erase {
                     cell.store(-1, Ordering::Relaxed);
-                } else if record && touching {
-                    cell.store(live_pitch, Ordering::Relaxed);
                 }
-                let recorded = cell.load(Ordering::Relaxed);
 
-                // Pitch for this step: live touch wins, else the recorded loop, else the param.
-                let pitch_deg = if touching {
-                    live_pitch
-                } else if recorded >= 0 {
-                    recorded
-                } else {
-                    p.pitch.value()
+                // The note the live generator produces this step at `pitch_deg`:
+                // onset comes from the (Y-driven) euclidean pattern, pitch from X.
+                let gen_note = |pitch_deg: i32, rng: &mut u64| -> Option<u8> {
+                    if !pattern[idx] {
+                        return None;
+                    }
+                    if p.percussive.value() {
+                        let prob = pitch_deg as f32 / PITCH_RANGE as f32;
+                        (xorshift(rng) < prob).then(|| p.note.value() as u8)
+                    } else {
+                        Some(scale_note(pitch_deg as u8))
+                    }
                 };
 
-                if pattern[idx] {
-                    // Melodic: scale pitch, always fires. Percussive: fixed note, X = probability.
-                    let (note, fire) = if p.percussive.value() {
-                        let prob = pitch_deg as f32 / PITCH_RANGE as f32;
-                        (p.note.value() as u8, xorshift(&mut self.rng[tr]) < prob)
-                    } else {
-                        (scale_note(pitch_deg as u8), true)
-                    };
-                    if fire {
-                        let velocity = if accents[idx] { p.accent_vel.value() } else { p.base_vel.value() };
-                        context.send_event(NoteEvent::NoteOn { timing, voice_id: None, channel: tr as u8, note, velocity });
-                        if let Some(o) = &self.osc {
-                            o.note(tr as u8, note, velocity);
-                        }
-                        self.playing_note[tr] = Some(note);
+                // What actually sounds this step. While touched we play (and, if
+                // armed, record) the live generator; otherwise a recorded loop plays
+                // its literal notes; otherwise the latched generator runs.
+                let emit: Option<u8> = if touching {
+                    let n = gen_note(live_pitch, &mut self.rng[tr]);
+                    if record {
+                        // record the literal outcome: the note that fired, or a rest
+                        cell.store(n.map(|x| x as i32).unwrap_or(-2), Ordering::Relaxed);
                     }
+                    n
+                } else if has_rec {
+                    let v = cell.load(Ordering::Relaxed);
+                    (v >= 0).then_some(v as u8)
+                } else {
+                    gen_note(p.pitch.value(), &mut self.rng[tr])
+                };
+
+                if let Some(note) = emit {
+                    let velocity = if accents[idx] { p.accent_vel.value() } else { p.base_vel.value() };
+                    context.send_event(NoteEvent::NoteOn { timing, voice_id: None, channel: tr as u8, note, velocity });
+                    if let Some(o) = &self.osc {
+                        o.note(tr as u8, note, velocity);
+                    }
+                    self.playing_note[tr] = Some(note);
                 }
             }
 
