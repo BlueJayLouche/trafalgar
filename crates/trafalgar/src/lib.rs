@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 mod editor;
+mod osc;
 
 pub(crate) const STEPS: usize = 16;
 pub(crate) const NUM_TRACKS: usize = 4;
@@ -127,6 +128,7 @@ pub struct Trafalgar {
     last_step: [i64; NUM_TRACKS],
     playing_note: [Option<u8>; NUM_TRACKS],
     rng: [u64; NUM_TRACKS],
+    osc: Option<osc::OscSender>,
 }
 
 impl Default for Trafalgar {
@@ -142,6 +144,7 @@ impl Default for Trafalgar {
             rng: std::array::from_fn(|i| {
                 0x9E37_79B9_7F4A_7C15u64.wrapping_add((i as u64).wrapping_mul(0x1234_5678_9ABC_DEF1))
             }),
+            osc: None,
         }
     }
 }
@@ -174,6 +177,18 @@ impl Plugin for Trafalgar {
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         editor::create(self.params.clone(), self.shared.clone(), self.params.editor_state.clone())
+    }
+
+    fn initialize(
+        &mut self,
+        _audio_io_layout: &AudioIOLayout,
+        _buffer_config: &BufferConfig,
+        _context: &mut impl InitContext<Self>,
+    ) -> bool {
+        if self.osc.is_none() {
+            self.osc = osc::OscSender::new();
+        }
+        true
     }
 
     fn reset(&mut self) {
@@ -251,6 +266,9 @@ impl Plugin for Trafalgar {
                     if fire {
                         let velocity = if accents[idx] { p.accent_vel.value() } else { p.base_vel.value() };
                         context.send_event(NoteEvent::NoteOn { timing, voice_id: None, channel: tr as u8, note, velocity });
+                        if let Some(o) = &self.osc {
+                            o.note(tr as u8, note, velocity);
+                        }
                         self.playing_note[tr] = Some(note);
                     }
                 }

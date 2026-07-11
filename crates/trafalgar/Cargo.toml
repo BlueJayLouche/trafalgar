@@ -18,3 +18,4 @@ path = "src/bin/standalone.rs"
 [dependencies]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone"] }
 nih_plug_vizia = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+rosc = "0.11"
