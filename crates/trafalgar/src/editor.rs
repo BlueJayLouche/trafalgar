@@ -23,7 +23,7 @@ struct Data {
 impl Model for Data {}
 
 pub fn default_state() -> Arc<ViziaState> {
-    ViziaState::new(|| (700, 500))
+    ViziaState::new(|| (700, 560))
 }
 
 pub fn create(
@@ -79,18 +79,18 @@ fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared
     .row_between(Pixels(3.0));
 }
 
-/// A labelled slider row: a short name on the left, the slider filling the rest.
+/// A labelled slider: a small name above the slider.
 fn slider_row<P, F>(cx: &mut Context, label: &'static str, f: F)
 where
     P: Param + 'static,
     F: Fn(&Arc<TrafalgarParams>) -> &P + Copy + 'static,
 {
-    HStack::new(cx, |cx| {
-        Label::new(cx, label).width(Pixels(46.0)).font_size(11.0);
-        ParamSlider::new(cx, Data::params, f);
+    VStack::new(cx, |cx| {
+        Label::new(cx, label).font_size(10.0);
+        ParamSlider::new(cx, Data::params, f).height(Pixels(20.0));
     })
-    .col_between(Pixels(4.0))
-    .height(Auto);
+    .height(Auto)
+    .row_between(Pixels(1.0));
 }
 
 /// Two-parameter performance pad for one track. X drives pitch, Y drives density.
