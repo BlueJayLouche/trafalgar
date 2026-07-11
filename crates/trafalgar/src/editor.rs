@@ -3,6 +3,8 @@
 // plus that track's mode/hold buttons and param sliders. A 30fps timer drives
 // redraws so the playheads animate.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +24,23 @@ struct Data {
 }
 impl Model for Data {}
 
+/// Undo history: (track, snapshot of that track's whole gesture buffer before a
+/// change). GUI-thread only, so Rc<RefCell> is fine. Transient across editor reopen.
+type UndoStack = Rc<RefCell<Vec<(usize, Vec<i32>)>>>;
+const UNDO_LIMIT: usize = 64;
+
+fn snapshot(shared: &Shared, track: usize) -> Vec<i32> {
+    shared.gesture[track].iter().map(|c| c.load(Ordering::Relaxed)).collect()
+}
+
+fn push_undo(undo: &UndoStack, shared: &Shared, track: usize) {
+    let mut u = undo.borrow_mut();
+    u.push((track, snapshot(shared, track)));
+    if u.len() > UNDO_LIMIT {
+        u.remove(0);
+    }
+}
+
 pub fn default_state() -> Arc<ViziaState> {
     ViziaState::new(|| (700, 560))
 }
@@ -35,6 +54,9 @@ pub fn create(
         assets::register_noto_sans_light(cx);
         Data { params: params.clone() }.build(cx);
 
+        // Undo history lives here, shared among this build's widgets (GUI thread).
+        let undo: UndoStack = Rc::new(RefCell::new(Vec::new()));
+
         // ~30fps redraw so the euclidean step heads animate.
         let timer = cx.add_timer(Duration::from_millis(33), None, |cx, action| {
             if matches!(action, TimerAction::Tick(_)) {
@@ -44,10 +66,16 @@ pub fn create(
         cx.start_timer(timer);
 
         VStack::new(cx, |cx| {
-            Label::new(cx, "TRAFALGAR").font_size(22.0).top(Pixels(4.0));
+            HStack::new(cx, |cx| {
+                Label::new(cx, "TRAFALGAR").font_size(22.0);
+                UndoButton::new(cx, shared.clone(), undo.clone());
+            })
+            .col_between(Pixels(12.0))
+            .top(Pixels(4.0))
+            .height(Auto);
             HStack::new(cx, |cx| {
                 for i in 0..NUM_TRACKS {
-                    track_column(cx, i, params.clone(), shared.clone());
+                    track_column(cx, i, params.clone(), shared.clone(), undo.clone());
                 }
             })
             .col_between(Pixels(8.0))
@@ -58,12 +86,12 @@ pub fn create(
     })
 }
 
-fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared: Arc<Shared>) {
+fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared: Arc<Shared>, undo: UndoStack) {
     const NAMES: [&str; NUM_TRACKS] = ["TRACK 1", "TRACK 2", "TRACK 3", "TRACK 4"];
     VStack::new(cx, |cx| {
         Label::new(cx, NAMES[i]).font_size(13.0);
 
-        XyPad::new(cx, Data::params, params, shared.clone(), i)
+        XyPad::new(cx, Data::params, params, shared.clone(), undo.clone(), i)
             .width(Pixels(150.0))
             .height(Pixels(150.0));
 
@@ -75,7 +103,7 @@ fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared
         .height(Auto);
         HStack::new(cx, |cx| {
             ParamButton::new(cx, Data::params, move |p| &p.tracks[i].record);
-            HoldButton::new(cx, shared.clone(), i, "Erase"); // momentary: erases only while held
+            HoldButton::new(cx, shared.clone(), undo.clone(), i, "Erase"); // momentary: erases only while held
         })
         .col_between(Pixels(4.0))
         .height(Auto);
@@ -108,12 +136,13 @@ where
 /// capture, cleared on release). Used for Figure-style scrub erase.
 pub struct HoldButton {
     shared: Arc<Shared>,
+    undo: UndoStack,
     track: usize,
 }
 
 impl HoldButton {
-    pub fn new<'a>(cx: &'a mut Context, shared: Arc<Shared>, track: usize, label: &'static str) -> Handle<'a, Self> {
-        Self { shared, track }
+    pub fn new<'a>(cx: &'a mut Context, shared: Arc<Shared>, undo: UndoStack, track: usize, label: &'static str) -> Handle<'a, Self> {
+        Self { shared, undo, track }
             .build(cx, |cx| {
                 Label::new(cx, label).hoverable(false);
             })
@@ -132,6 +161,7 @@ impl View for HoldButton {
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
         event.map(|window_event, meta| match *window_event {
             WindowEvent::MouseDown(MouseButton::Left) => {
+                push_undo(&self.undo, &self.shared, self.track); // snapshot before erasing
                 self.shared.erase[self.track].store(true, Ordering::Relaxed);
                 cx.capture();
                 meta.consume();
@@ -146,6 +176,44 @@ impl View for HoldButton {
     }
 }
 
+/// Global undo: restores the most recently changed track's loop from history.
+pub struct UndoButton {
+    shared: Arc<Shared>,
+    undo: UndoStack,
+}
+
+impl UndoButton {
+    pub fn new<'a>(cx: &'a mut Context, shared: Arc<Shared>, undo: UndoStack) -> Handle<'a, Self> {
+        Self { shared, undo }
+            .build(cx, |cx| {
+                Label::new(cx, "Undo").hoverable(false);
+            })
+            .height(Pixels(22.0))
+            .width(Pixels(64.0))
+            .child_space(Stretch(1.0))
+            .background_color(Color::rgb(52, 52, 60))
+    }
+}
+
+impl View for UndoButton {
+    fn element(&self) -> Option<&'static str> {
+        Some("undo-button")
+    }
+
+    fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event, meta| {
+            if let WindowEvent::MouseDown(MouseButton::Left) = *window_event {
+                if let Some((track, snap)) = self.undo.borrow_mut().pop() {
+                    for (c, &v) in self.shared.gesture[track].iter().zip(&snap) {
+                        c.store(v, Ordering::Relaxed);
+                    }
+                }
+                meta.consume();
+            }
+        });
+    }
+}
+
 /// Two-parameter performance pad for one track. X drives pitch, Y drives density.
 /// Draws the live euclidean pattern with the playhead and an accent ring.
 pub struct XyPad {
@@ -153,18 +221,20 @@ pub struct XyPad {
     y: ParamWidgetBase,           // density (write)
     params: Arc<TrafalgarParams>, // read-only, for drawing
     shared: Arc<Shared>,          // gate (GUI->audio) + step (audio->GUI)
+    undo: UndoStack,
     track: usize,
     drag: bool,
 }
 
 impl XyPad {
-    pub fn new<L>(
-        cx: &mut Context,
+    pub fn new<'a, L>(
+        cx: &'a mut Context,
         lens: L,
         params: Arc<TrafalgarParams>,
         shared: Arc<Shared>,
+        undo: UndoStack,
         track: usize,
-    ) -> Handle<Self>
+    ) -> Handle<'a, Self>
     where
         L: Lens<Target = Arc<TrafalgarParams>> + Clone,
     {
@@ -173,6 +243,7 @@ impl XyPad {
             y: ParamWidgetBase::new(cx, lens, move |p| &p.tracks[track].density),
             params,
             shared,
+            undo,
             track,
             drag: false,
         }
@@ -204,6 +275,10 @@ impl View for XyPad {
         event.map(|window_event, meta| match *window_event {
             WindowEvent::MouseDown(MouseButton::Left) => {
                 self.drag = true;
+                // Snapshot the loop before a record pass so it can be undone.
+                if self.params.tracks[self.track].record.value() {
+                    push_undo(&self.undo, &self.shared, self.track);
+                }
                 cx.capture();
                 self.x.begin_set_parameter(cx);
                 self.y.begin_set_parameter(cx);
