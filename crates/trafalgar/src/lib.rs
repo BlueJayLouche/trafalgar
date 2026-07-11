@@ -1,7 +1,7 @@
-// Trafalgar — euclidean jam sequencer. This first slice ports the validated
-// prototype (euclid + rotation + pentatonic pitch) into a real nih-plug plugin
-// that sequences off the host transport and emits MIDI. No editor/OSC/multi-track
-// yet — those are the next increments. Builds as CLAP, VST3, and standalone.
+// Trafalgar — euclidean jam sequencer. nih-plug plugin emitting MIDI from four
+// independent euclidean tracks driven by the host transport. Each track has its
+// own XY pad (X = pitch/probability, Y = density), euclidean accents, a hold gate,
+// a melodic/percussive mode, and its own MIDI channel. Builds CLAP/VST3/standalone.
 
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
@@ -12,6 +12,7 @@ use std::sync::Arc;
 mod editor;
 
 pub(crate) const STEPS: usize = 16;
+pub(crate) const NUM_TRACKS: usize = 4;
 const BASE_NOTE: u8 = 48; // C3
 pub(crate) const PITCH_RANGE: i32 = 15; // scale degrees the pitch param spans
 const PENTATONIC: [u8; 5] = [0, 3, 5, 7, 10]; // minor pentatonic
@@ -53,35 +54,32 @@ fn scale_note(degree: u8) -> u8 {
     (BASE_NOTE as i32 + 12 * oct + step as i32).clamp(0, 127) as u8
 }
 
+/// One euclidean voice.
 #[derive(Params)]
-struct TrafalgarParams {
+pub(crate) struct TrackParams {
     #[id = "density"]
-    density: IntParam,
+    pub density: IntParam,
     #[id = "rotation"]
-    rotation: IntParam,
+    pub rotation: IntParam,
     #[id = "pitch"]
-    pitch: IntParam,
-    /// How many steps carry an accent (a second euclidean layer).
+    pub pitch: IntParam,
     #[id = "accent"]
-    accent: IntParam,
+    pub accent: IntParam,
     #[id = "basevel"]
-    base_vel: FloatParam,
+    pub base_vel: FloatParam,
     #[id = "accentvel"]
-    accent_vel: FloatParam,
-    /// Hold on = latched/continuous. Hold off = only sounds while dragging the pad.
+    pub accent_vel: FloatParam,
+    /// Hold on = latched. Hold off = only sounds while dragging the pad.
     #[id = "hold"]
-    hold: BoolParam,
+    pub hold: BoolParam,
     /// Percussive: fixed drum note, X axis = hit probability. Melodic: X = scale pitch.
     #[id = "perc"]
-    percussive: BoolParam,
+    pub percussive: BoolParam,
     #[id = "note"]
-    note: IntParam,
-
-    #[persist = "editor-state"]
-    editor_state: Arc<ViziaState>,
+    pub note: IntParam,
 }
 
-impl Default for TrafalgarParams {
+impl Default for TrackParams {
     fn default() -> Self {
         Self {
             density: IntParam::new("Density", 4, IntRange::Linear { min: 1, max: STEPS as i32 }),
@@ -93,31 +91,57 @@ impl Default for TrafalgarParams {
             hold: BoolParam::new("Hold", true),
             percussive: BoolParam::new("Percussive", false),
             note: IntParam::new("Drum Note", 36, IntRange::Linear { min: 0, max: 127 }),
+        }
+    }
+}
+
+#[derive(Params)]
+struct TrafalgarParams {
+    #[nested(array, group = "Track")]
+    tracks: [TrackParams; NUM_TRACKS],
+
+    #[persist = "editor-state"]
+    editor_state: Arc<ViziaState>,
+}
+
+impl Default for TrafalgarParams {
+    fn default() -> Self {
+        Self {
+            tracks: std::array::from_fn(|_| TrackParams::default()),
             editor_state: editor::default_state(),
         }
     }
 }
 
+/// Per-track runtime state, shared audio<->GUI where needed.
+pub(crate) struct Shared {
+    /// Pad touch state per track (GUI -> audio); gates notes when Hold is off.
+    pub gate: [AtomicBool; NUM_TRACKS],
+    /// Current playhead step per track (audio -> GUI); -1 = idle.
+    pub step: [AtomicI64; NUM_TRACKS],
+}
+
 pub struct Trafalgar {
     params: Arc<TrafalgarParams>,
-    /// Pad touch state, shared GUI -> audio. Gates notes when Hold is off.
-    gate: Arc<AtomicBool>,
-    /// Current playhead step, shared audio -> GUI for the step display. -1 = idle.
-    step: Arc<AtomicI64>,
-    last_step: i64,           // last step index emitted; -1 = none
-    playing_note: Option<u8>, // currently sounding note (monophonic, this slice)
-    rng: u64,                 // xorshift state for percussive hit probability
+    shared: Arc<Shared>,
+    last_step: [i64; NUM_TRACKS],
+    playing_note: [Option<u8>; NUM_TRACKS],
+    rng: [u64; NUM_TRACKS],
 }
 
 impl Default for Trafalgar {
     fn default() -> Self {
         Self {
             params: Arc::new(TrafalgarParams::default()),
-            gate: Arc::new(AtomicBool::new(false)),
-            step: Arc::new(AtomicI64::new(-1)),
-            last_step: -1,
-            playing_note: None,
-            rng: 0x9E37_79B9_7F4A_7C15,
+            shared: Arc::new(Shared {
+                gate: std::array::from_fn(|_| AtomicBool::new(false)),
+                step: std::array::from_fn(|_| AtomicI64::new(-1)),
+            }),
+            last_step: [-1; NUM_TRACKS],
+            playing_note: [None; NUM_TRACKS],
+            rng: std::array::from_fn(|i| {
+                0x9E37_79B9_7F4A_7C15u64.wrapping_add((i as u64).wrapping_mul(0x1234_5678_9ABC_DEF1))
+            }),
         }
     }
 }
@@ -149,17 +173,12 @@ impl Plugin for Trafalgar {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(
-            self.params.clone(),
-            self.gate.clone(),
-            self.step.clone(),
-            self.params.editor_state.clone(),
-        )
+        editor::create(self.params.clone(), self.shared.clone(), self.params.editor_state.clone())
     }
 
     fn reset(&mut self) {
-        self.last_step = -1;
-        self.playing_note = None;
+        self.last_step = [-1; NUM_TRACKS];
+        self.playing_note = [None; NUM_TRACKS];
     }
 
     fn process(
@@ -177,67 +196,69 @@ impl Plugin for Trafalgar {
         let sr = t.sample_rate as f64;
         let block = buffer.samples();
 
-        // Need tempo + position + play state to sequence. Otherwise idle (and
-        // release any hanging note).
         let (Some(tempo), Some(pos)) = (t.tempo, t.pos_samples()) else {
-            if let Some(n) = self.playing_note.take() {
-                context.send_event(NoteEvent::NoteOff { timing: 0, voice_id: None, channel: 0, note: n, velocity: 0.0 });
+            for tr in 0..NUM_TRACKS {
+                if let Some(n) = self.playing_note[tr].take() {
+                    context.send_event(NoteEvent::NoteOff { timing: 0, voice_id: None, channel: tr as u8, note: n, velocity: 0.0 });
+                }
+                self.shared.step[tr].store(-1, Ordering::Relaxed);
             }
             return ProcessStatus::Normal;
         };
-        // Hold on => always sound; Hold off => only while the pad is being dragged.
-        let gate_open = self.params.hold.value() || self.gate.load(Ordering::Relaxed);
-        if !t.playing || !gate_open {
-            if let Some(n) = self.playing_note.take() {
-                context.send_event(NoteEvent::NoteOff { timing: 0, voice_id: None, channel: 0, note: n, velocity: 0.0 });
-            }
-            self.last_step = -1;
-            self.step.store(-1, Ordering::Relaxed);
-            return ProcessStatus::Normal;
-        }
-
+        let playing = t.playing;
         let samples_per_step = 60.0 / tempo * sr / 4.0; // 16th notes
-        let density = self.params.density.value() as usize;
-        let rotation = self.params.rotation.value() as usize;
-        let pattern = rotated(density, STEPS, rotation);
-        // Second euclidean layer picks accented (louder) steps.
-        let accents = euclid(self.params.accent.value() as usize, STEPS);
 
-        for s in 0..block {
-            let global = pos + s as i64;
-            let step = (global as f64 / samples_per_step).floor() as i64;
-            if step == self.last_step {
+        for tr in 0..NUM_TRACKS {
+            let p = &self.params.tracks[tr];
+
+            // Hold on => always sound; Hold off => only while the pad is dragged.
+            let gate_open = p.hold.value() || self.shared.gate[tr].load(Ordering::Relaxed);
+            if !playing || !gate_open {
+                if let Some(n) = self.playing_note[tr].take() {
+                    context.send_event(NoteEvent::NoteOff { timing: 0, voice_id: None, channel: tr as u8, note: n, velocity: 0.0 });
+                }
+                self.last_step[tr] = -1;
+                self.shared.step[tr].store(-1, Ordering::Relaxed);
                 continue;
             }
-            self.last_step = step;
-            let timing = s as u32;
 
-            // note-off the previous note at the step boundary (monophonic)
-            if let Some(n) = self.playing_note.take() {
-                context.send_event(NoteEvent::NoteOff { timing, voice_id: None, channel: 0, note: n, velocity: 0.0 });
-            }
-            let idx = step.rem_euclid(STEPS as i64) as usize;
-            if pattern[idx] {
-                // Melodic: scale pitch, always fires. Percussive: fixed note, X = probability.
-                let (note, fire) = if self.params.percussive.value() {
-                    let prob = self.params.pitch.value() as f32 / PITCH_RANGE as f32;
-                    (self.params.note.value() as u8, xorshift(&mut self.rng) < prob)
-                } else {
-                    (scale_note(self.params.pitch.value() as u8), true)
-                };
-                if fire {
-                    let velocity = if accents[idx] {
-                        self.params.accent_vel.value()
+            let pattern = rotated(p.density.value() as usize, STEPS, p.rotation.value() as usize);
+            let accents = euclid(p.accent.value() as usize, STEPS);
+
+            for s in 0..block {
+                let global = pos + s as i64;
+                let stp = (global as f64 / samples_per_step).floor() as i64;
+                if stp == self.last_step[tr] {
+                    continue;
+                }
+                self.last_step[tr] = stp;
+                let timing = s as u32;
+
+                // note-off the previous note at the step boundary (monophonic per track)
+                if let Some(n) = self.playing_note[tr].take() {
+                    context.send_event(NoteEvent::NoteOff { timing, voice_id: None, channel: tr as u8, note: n, velocity: 0.0 });
+                }
+
+                let idx = stp.rem_euclid(STEPS as i64) as usize;
+                if pattern[idx] {
+                    // Melodic: scale pitch, always fires. Percussive: fixed note, X = probability.
+                    let (note, fire) = if p.percussive.value() {
+                        let prob = p.pitch.value() as f32 / PITCH_RANGE as f32;
+                        (p.note.value() as u8, xorshift(&mut self.rng[tr]) < prob)
                     } else {
-                        self.params.base_vel.value()
+                        (scale_note(p.pitch.value() as u8), true)
                     };
-                    context.send_event(NoteEvent::NoteOn { timing, voice_id: None, channel: 0, note, velocity });
-                    self.playing_note = Some(note);
+                    if fire {
+                        let velocity = if accents[idx] { p.accent_vel.value() } else { p.base_vel.value() };
+                        context.send_event(NoteEvent::NoteOn { timing, voice_id: None, channel: tr as u8, note, velocity });
+                        self.playing_note[tr] = Some(note);
+                    }
                 }
             }
+
+            self.shared.step[tr].store(self.last_step[tr].rem_euclid(STEPS as i64), Ordering::Relaxed);
         }
 
-        self.step.store(self.last_step.rem_euclid(STEPS as i64), Ordering::Relaxed);
         ProcessStatus::Normal
     }
 }

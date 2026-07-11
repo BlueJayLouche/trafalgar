@@ -1,8 +1,9 @@
-// Vizia editor: the XY performance pad (X = pitch keybed, Y = density) with a live
-// euclidean step display, plus stock param widgets. One track for now. The pad is
-// the only custom widget; a 30fps timer drives redraws so the playhead animates.
+// Vizia editor: four track columns side by side. Each column = an XY performance
+// pad (X = pitch/probability, Y = density) with a live euclidean step display,
+// plus that track's mode/hold buttons and param sliders. A 30fps timer drives
+// redraws so the playheads animate.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use nih_plug_vizia::widgets::param_base::ParamWidgetBase;
 use nih_plug_vizia::widgets::{ParamButton, ParamSlider};
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 
-use crate::{euclid, rotated, TrafalgarParams, PITCH_RANGE, STEPS};
+use crate::{euclid, rotated, Shared, TrafalgarParams, NUM_TRACKS, PITCH_RANGE, STEPS};
 
 #[derive(Lens)]
 struct Data {
@@ -22,20 +23,19 @@ struct Data {
 impl Model for Data {}
 
 pub fn default_state() -> Arc<ViziaState> {
-    ViziaState::new(|| (300, 480))
+    ViziaState::new(|| (680, 440))
 }
 
 pub fn create(
     params: Arc<TrafalgarParams>,
-    gate: Arc<AtomicBool>,
-    step: Arc<AtomicI64>,
+    shared: Arc<Shared>,
     state: Arc<ViziaState>,
 ) -> Option<Box<dyn Editor>> {
     create_vizia_editor(state, ViziaTheming::Custom, move |cx, _| {
         assets::register_noto_sans_light(cx);
         Data { params: params.clone() }.build(cx);
 
-        // ~30fps redraw so the euclidean step head animates.
+        // ~30fps redraw so the euclidean step heads animate.
         let timer = cx.add_timer(Duration::from_millis(33), None, |cx, action| {
             if matches!(action, TimerAction::Tick(_)) {
                 cx.needs_redraw();
@@ -45,41 +45,47 @@ pub fn create(
 
         VStack::new(cx, |cx| {
             Label::new(cx, "TRAFALGAR").font_size(22.0).top(Pixels(4.0));
-
-            XyPad::new(cx, Data::params, params.clone(), gate.clone(), step.clone())
-                .width(Pixels(260.0))
-                .height(Pixels(260.0));
-
             HStack::new(cx, |cx| {
-                ParamButton::new(cx, Data::params, |p| &p.hold);
-                ParamButton::new(cx, Data::params, |p| &p.percussive);
+                for i in 0..NUM_TRACKS {
+                    track_column(cx, i, params.clone(), shared.clone());
+                }
             })
-            .col_between(Pixels(6.0))
+            .col_between(Pixels(8.0))
             .height(Auto);
-            Label::new(cx, "Drum note (percussive)");
-            ParamSlider::new(cx, Data::params, |p| &p.note);
-            Label::new(cx, "Rotation");
-            ParamSlider::new(cx, Data::params, |p| &p.rotation);
-            Label::new(cx, "Accent");
-            ParamSlider::new(cx, Data::params, |p| &p.accent);
-            Label::new(cx, "Velocity");
-            ParamSlider::new(cx, Data::params, |p| &p.base_vel);
-            Label::new(cx, "Accent level");
-            ParamSlider::new(cx, Data::params, |p| &p.accent_vel);
         })
         .child_space(Pixels(10.0))
-        .row_between(Pixels(6.0));
+        .row_between(Pixels(8.0));
     })
 }
 
-/// Two-parameter performance pad. X drives pitch, Y drives density (up = denser).
+fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared: Arc<Shared>) {
+    const NAMES: [&str; NUM_TRACKS] = ["TRACK 1", "TRACK 2", "TRACK 3", "TRACK 4"];
+    VStack::new(cx, |cx| {
+        Label::new(cx, NAMES[i]).font_size(13.0);
+
+        XyPad::new(cx, Data::params, params, shared, i)
+            .width(Pixels(150.0))
+            .height(Pixels(150.0));
+
+        ParamButton::new(cx, Data::params, move |p| &p.tracks[i].hold);
+        ParamButton::new(cx, Data::params, move |p| &p.tracks[i].percussive);
+        ParamSlider::new(cx, Data::params, move |p| &p.tracks[i].rotation);
+        ParamSlider::new(cx, Data::params, move |p| &p.tracks[i].accent);
+        ParamSlider::new(cx, Data::params, move |p| &p.tracks[i].base_vel);
+        ParamSlider::new(cx, Data::params, move |p| &p.tracks[i].note);
+    })
+    .width(Pixels(160.0))
+    .row_between(Pixels(3.0));
+}
+
+/// Two-parameter performance pad for one track. X drives pitch, Y drives density.
 /// Draws the live euclidean pattern with the playhead and an accent ring.
 pub struct XyPad {
     x: ParamWidgetBase,           // pitch (write)
     y: ParamWidgetBase,           // density (write)
     params: Arc<TrafalgarParams>, // read-only, for drawing
-    gate: Arc<AtomicBool>,        // pad touch state -> audio thread
-    step: Arc<AtomicI64>,         // playhead step from audio thread (-1 = idle)
+    shared: Arc<Shared>,          // gate (GUI->audio) + step (audio->GUI)
+    track: usize,
     drag: bool,
 }
 
@@ -88,18 +94,18 @@ impl XyPad {
         cx: &mut Context,
         lens: L,
         params: Arc<TrafalgarParams>,
-        gate: Arc<AtomicBool>,
-        step: Arc<AtomicI64>,
+        shared: Arc<Shared>,
+        track: usize,
     ) -> Handle<Self>
     where
         L: Lens<Target = Arc<TrafalgarParams>> + Clone,
     {
         Self {
-            x: ParamWidgetBase::new(cx, lens.clone(), |p| &p.pitch),
-            y: ParamWidgetBase::new(cx, lens, |p| &p.density),
+            x: ParamWidgetBase::new(cx, lens.clone(), move |p| &p.tracks[track].pitch),
+            y: ParamWidgetBase::new(cx, lens, move |p| &p.tracks[track].density),
             params,
-            gate,
-            step,
+            shared,
+            track,
             drag: false,
         }
         .build(cx, |_| {})
@@ -126,7 +132,7 @@ impl View for XyPad {
         event.map(|window_event, meta| match *window_event {
             WindowEvent::MouseDown(MouseButton::Left) => {
                 self.drag = true;
-                self.gate.store(true, Ordering::Relaxed);
+                self.shared.gate[self.track].store(true, Ordering::Relaxed);
                 cx.capture();
                 self.x.begin_set_parameter(cx);
                 self.y.begin_set_parameter(cx);
@@ -142,7 +148,7 @@ impl View for XyPad {
             WindowEvent::MouseUp(MouseButton::Left) => {
                 if self.drag {
                     self.drag = false;
-                    self.gate.store(false, Ordering::Relaxed);
+                    self.shared.gate[self.track].store(false, Ordering::Relaxed);
                     self.x.end_set_parameter(cx);
                     self.y.end_set_parameter(cx);
                     cx.release();
@@ -158,6 +164,7 @@ impl View for XyPad {
         if b.w == 0.0 || b.h == 0.0 {
             return;
         }
+        let p = &self.params.tracks[self.track];
 
         // background
         let mut bg = vg::Path::new();
@@ -165,26 +172,23 @@ impl View for XyPad {
         canvas.fill_path(&bg, &vg::Paint::color(vg::Color::rgb(24, 24, 28)));
 
         // live euclidean pattern along the bottom
-        let density = self.params.density.value() as usize;
-        let rotation = self.params.rotation.value() as usize;
-        let pattern = rotated(density, STEPS, rotation);
-        let accents = euclid(self.params.accent.value() as usize, STEPS);
-        let cur = self.step.load(Ordering::Relaxed);
+        let pattern = rotated(p.density.value() as usize, STEPS, p.rotation.value() as usize);
+        let accents = euclid(p.accent.value() as usize, STEPS);
+        let cur = self.shared.step[self.track].load(Ordering::Relaxed);
         let accent_col = vg::Color::rgb(255, 120, 80);
         for s in 0..STEPS {
             let x = b.x + b.w * (s as f32 + 0.5) / STEPS as f32;
-            let y = b.bottom() - 16.0;
+            let y = b.bottom() - 14.0;
             let is_cur = cur == s as i64;
             let (r, col) = match (pattern[s], is_cur) {
-                (true, true) => (7.0, accent_col),
-                (true, false) => (5.0, vg::Color::rgb(200, 200, 200)),
-                (false, true) => (5.0, vg::Color::rgb(120, 60, 40)),
-                (false, false) => (3.0, vg::Color::rgb(70, 70, 70)),
+                (true, true) => (6.0, accent_col),
+                (true, false) => (4.0, vg::Color::rgb(200, 200, 200)),
+                (false, true) => (4.0, vg::Color::rgb(120, 60, 40)),
+                (false, false) => (2.0, vg::Color::rgb(70, 70, 70)),
             };
             let mut dot = vg::Path::new();
             dot.circle(x, y, r);
             canvas.fill_path(&dot, &vg::Paint::color(col));
-            // accent ring on accented onsets
             if pattern[s] && accents[s] {
                 let mut ring = vg::Path::new();
                 ring.circle(x, y, r + 3.0);
@@ -193,8 +197,8 @@ impl View for XyPad {
         }
 
         // crosshair derived from the actual pitch/density params (tracks automation)
-        let nx = self.params.pitch.value() as f32 / PITCH_RANGE as f32;
-        let ny = 1.0 - (self.params.density.value() - 1) as f32 / (STEPS as f32 - 1.0);
+        let nx = p.pitch.value() as f32 / PITCH_RANGE as f32;
+        let ny = 1.0 - (p.density.value() - 1) as f32 / (STEPS as f32 - 1.0);
         let px = b.x + nx * b.w;
         let py = b.y + ny * b.h;
 
@@ -209,7 +213,7 @@ impl View for XyPad {
         );
 
         let mut ring = vg::Path::new();
-        ring.circle(px, py, 8.0);
+        ring.circle(px, py, 7.0);
         canvas.stroke_path(&ring, &vg::Paint::color(accent_col).with_line_width(2.0));
     }
 }
