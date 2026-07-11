@@ -63,7 +63,7 @@ fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared
     VStack::new(cx, |cx| {
         Label::new(cx, NAMES[i]).font_size(13.0);
 
-        XyPad::new(cx, Data::params, params, shared, i)
+        XyPad::new(cx, Data::params, params, shared.clone(), i)
             .width(Pixels(150.0))
             .height(Pixels(150.0));
 
@@ -75,10 +75,11 @@ fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared
         .height(Auto);
         HStack::new(cx, |cx| {
             ParamButton::new(cx, Data::params, move |p| &p.tracks[i].record);
-            ParamButton::new(cx, Data::params, move |p| &p.tracks[i].erase);
+            HoldButton::new(cx, shared.clone(), i, "Erase"); // momentary: erases only while held
         })
         .col_between(Pixels(4.0))
         .height(Auto);
+        slider_row(cx, "Bars", move |p| &p.tracks[i].length);
         slider_row(cx, "Rot", move |p| &p.tracks[i].rotation);
         slider_row(cx, "Accent", move |p| &p.tracks[i].accent);
         slider_row(cx, "Vel", move |p| &p.tracks[i].base_vel);
@@ -101,6 +102,48 @@ where
     })
     .height(Auto)
     .row_between(Pixels(1.0));
+}
+
+/// A momentary button: sets `shared.erase[track]` true only while held (press +
+/// capture, cleared on release). Used for Figure-style scrub erase.
+pub struct HoldButton {
+    shared: Arc<Shared>,
+    track: usize,
+}
+
+impl HoldButton {
+    pub fn new<'a>(cx: &'a mut Context, shared: Arc<Shared>, track: usize, label: &'static str) -> Handle<'a, Self> {
+        Self { shared, track }
+            .build(cx, |cx| {
+                Label::new(cx, label).hoverable(false);
+            })
+            .height(Pixels(24.0))
+            .width(Stretch(1.0))
+            .child_space(Stretch(1.0))
+            .background_color(Color::rgb(72, 46, 46))
+    }
+}
+
+impl View for HoldButton {
+    fn element(&self) -> Option<&'static str> {
+        Some("hold-button")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|window_event, meta| match *window_event {
+            WindowEvent::MouseDown(MouseButton::Left) => {
+                self.shared.erase[self.track].store(true, Ordering::Relaxed);
+                cx.capture();
+                meta.consume();
+            }
+            WindowEvent::MouseUp(MouseButton::Left) => {
+                self.shared.erase[self.track].store(false, Ordering::Relaxed);
+                cx.release();
+                meta.consume();
+            }
+            _ => {}
+        });
+    }
 }
 
 /// Two-parameter performance pad for one track. X drives pitch, Y drives density.
@@ -203,12 +246,12 @@ impl View for XyPad {
         // live euclidean pattern along the bottom
         let pattern = rotated(p.density.value() as usize, STEPS, p.rotation.value() as usize);
         let accents = euclid(p.accent.value() as usize, STEPS);
-        let cur = self.shared.step[self.track].load(Ordering::Relaxed);
+        let cur = self.shared.step[self.track].load(Ordering::Relaxed); // absolute step, -1 idle
         let accent_col = vg::Color::rgb(255, 120, 80);
         for s in 0..STEPS {
             let x = b.x + b.w * (s as f32 + 0.5) / STEPS as f32;
             let y = b.bottom() - 14.0;
-            let is_cur = cur == s as i64;
+            let is_cur = cur >= 0 && cur.rem_euclid(STEPS as i64) == s as i64;
             let (r, col) = match (pattern[s], is_cur) {
                 (true, true) => (6.0, accent_col),
                 (true, false) => (4.0, vg::Color::rgb(200, 200, 200)),
@@ -245,18 +288,23 @@ impl View for XyPad {
         ring.circle(px, py, 7.0);
         canvas.stroke_path(&ring, &vg::Paint::color(accent_col).with_line_width(2.0));
 
-        // recorded gesture loop: a green dot per step, height = recorded pitch
+        // recorded gesture loop, spanning the full record length: a green dot per
+        // recorded step (height = pitch), the one at the playhead drawn brighter.
+        let loop_steps = self.params.tracks[self.track].length.value() as usize * STEPS;
+        let gcur = if cur >= 0 { cur.rem_euclid(loop_steps as i64) } else { -1 };
         let rec_col = vg::Color::rgb(90, 210, 140);
-        for s in 0..STEPS {
+        let rec_cur = vg::Color::rgb(150, 255, 190);
+        for s in 0..loop_steps {
             let v = self.shared.gesture[self.track][s].load(Ordering::Relaxed);
             if v < 0 {
                 continue;
             }
-            let gx = b.x + b.w * (s as f32 + 0.5) / STEPS as f32;
+            let gx = b.x + b.w * (s as f32 + 0.5) / loop_steps as f32;
             let gy = b.y + (1.0 - v as f32 / PITCH_RANGE as f32) * b.h;
+            let (r, col) = if gcur == s as i64 { (4.0, rec_cur) } else { (3.0, rec_col) };
             let mut d = vg::Path::new();
-            d.circle(gx, gy, 3.0);
-            canvas.fill_path(&d, &vg::Paint::color(rec_col));
+            d.circle(gx, gy, r);
+            canvas.fill_path(&d, &vg::Paint::color(col));
         }
     }
 }

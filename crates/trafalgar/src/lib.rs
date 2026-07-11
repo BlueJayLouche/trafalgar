@@ -14,6 +14,7 @@ mod osc;
 
 pub(crate) const STEPS: usize = 16;
 pub(crate) const NUM_TRACKS: usize = 4;
+pub(crate) const MAX_BARS: usize = 8; // longest recordable gesture loop
 const BASE_NOTE: u8 = 48; // C3
 pub(crate) const PITCH_RANGE: i32 = 15; // scale degrees the pitch param spans
 const PENTATONIC: [u8; 5] = [0, 3, 5, 7, 10]; // minor pentatonic
@@ -81,9 +82,9 @@ pub(crate) struct TrackParams {
     /// Armed: touching the pad writes the pitch into the loop at the playhead.
     #[id = "record"]
     pub record: BoolParam,
-    /// On: wipes the recorded loop as the playhead passes (Figure-style erase).
-    #[id = "erase"]
-    pub erase: BoolParam,
+    /// Gesture loop length in bars (the euclidean rhythm still repeats every bar).
+    #[id = "length"]
+    pub length: IntParam,
 }
 
 impl Default for TrackParams {
@@ -99,7 +100,7 @@ impl Default for TrackParams {
             percussive: BoolParam::new("Percussive", false),
             note: IntParam::new("Drum Note", 36, IntRange::Linear { min: 0, max: 127 }),
             record: BoolParam::new("Record", false),
-            erase: BoolParam::new("Erase", false),
+            length: IntParam::new("Bars", 1, IntRange::Linear { min: 1, max: MAX_BARS as i32 }),
         }
     }
 }
@@ -132,9 +133,12 @@ pub(crate) struct Shared {
     pub pos: [AtomicU64; NUM_TRACKS],
     /// Current playhead step per track (audio -> GUI); -1 = idle.
     pub step: [AtomicI64; NUM_TRACKS],
-    /// Recorded gesture: pitch degree per step, per track. -1 = empty. Owned by the
-    /// audio thread (record/erase/playback), read by the GUI to draw the loop.
-    pub gesture: [[AtomicI32; STEPS]; NUM_TRACKS],
+    /// Recorded gesture: pitch degree per step (up to MAX_BARS bars), per track.
+    /// -1 = empty. Owned by the audio thread (record/erase/playback), read by the
+    /// GUI to draw the loop.
+    pub gesture: [[AtomicI32; STEPS * MAX_BARS]; NUM_TRACKS],
+    /// Momentary erase (GUI -> audio): true only while the Erase button is held.
+    pub erase: [AtomicBool; NUM_TRACKS],
 }
 
 pub struct Trafalgar {
@@ -155,6 +159,7 @@ impl Default for Trafalgar {
                 pos: std::array::from_fn(|_| AtomicU64::new(0)),
                 step: std::array::from_fn(|_| AtomicI64::new(-1)),
                 gesture: std::array::from_fn(|_| std::array::from_fn(|_| AtomicI32::new(-1))),
+                erase: std::array::from_fn(|_| AtomicBool::new(false)),
             }),
             last_step: [-1; NUM_TRACKS],
             playing_note: [None; NUM_TRACKS],
@@ -260,8 +265,11 @@ impl Plugin for Trafalgar {
             };
 
             let record = p.record.value();
-            let erase = p.erase.value();
-            let has_rec = self.shared.gesture[tr].iter().any(|c| c.load(Ordering::Relaxed) >= 0);
+            let erase = self.shared.erase[tr].load(Ordering::Relaxed);
+            let loop_steps = p.length.value() as usize * STEPS;
+            let has_rec = self.shared.gesture[tr][..loop_steps]
+                .iter()
+                .any(|c| c.load(Ordering::Relaxed) >= 0);
 
             // Sound if Hold is on, the pad is touched, or a loop is recorded.
             let gate_open = p.hold.value() || touching || has_rec;
@@ -291,10 +299,11 @@ impl Plugin for Trafalgar {
                     context.send_event(NoteEvent::NoteOff { timing, voice_id: None, channel: tr as u8, note: n, velocity: 0.0 });
                 }
 
-                let idx = stp.rem_euclid(STEPS as i64) as usize;
+                let idx = stp.rem_euclid(STEPS as i64) as usize; // euclidean pattern (per bar)
+                let gidx = stp.rem_euclid(loop_steps as i64) as usize; // gesture loop position
 
                 // Record / erase / read the gesture loop at this step.
-                let cell = &self.shared.gesture[tr][idx];
+                let cell = &self.shared.gesture[tr][gidx];
                 if erase {
                     cell.store(-1, Ordering::Relaxed);
                 } else if record && touching {
@@ -330,7 +339,7 @@ impl Plugin for Trafalgar {
                 }
             }
 
-            self.shared.step[tr].store(self.last_step[tr].rem_euclid(STEPS as i64), Ordering::Relaxed);
+            self.shared.step[tr].store(self.last_step[tr], Ordering::Relaxed);
         }
 
         ProcessStatus::Normal
