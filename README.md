@@ -9,15 +9,20 @@ Not affiliated with Reason Studios.
 
 ## Status
 
-Early. The core interaction (dragging an XY pad live-morphs a euclidean pattern)
-is validated; this repo is the real build growing out from that.
+Playable. Four euclidean tracks, each with:
 
-- **v1 target:** 4 uniform euclidean tracks, each with an XY performance pad
-  (X = density, Y = pitch/velocity), a `melodic | percussive` mode, its own MIDI
-  channel, plus recordable gesture lanes → assignable MIDI CC / OSC, and a native
-  MIDI note-delay. Pure live jam (no scenes/song mode yet).
-- **Clock:** follows host transport as a plugin; internal clock + Ableton Link +
-  MIDI clock out in standalone.
+- An **XY performance pad** — X = pitch (keybed) / hit probability, Y = density —
+  with a live step display and a hold gate (off = touch-to-play).
+- **Rotation** and a second euclidean **accent** layer (base + accent velocity).
+- A `melodic | percussive` mode toggle and its own **MIDI channel** (0–3).
+
+Notes are emitted as MIDI and mirrored over **OSC** (`/fig/track/{n}/note`) to
+`127.0.0.1:9000`. Clock follows the host transport.
+
+**Not yet:** recordable gesture lanes → CC/OSC, a native MIDI note-delay,
+configurable OSC target, Ableton Link in standalone, scenes/song mode. The
+standalone runs the editor but does not yet route MIDI out to other apps (that
+lands with the dedicated MIDI/OSC output layer).
 
 ## Build
 
