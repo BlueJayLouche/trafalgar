@@ -117,9 +117,13 @@ impl XyPad {
             return;
         }
         let nx = ((mx - b.x) / b.w).clamp(0.0, 1.0);
-        let ny = ((my - b.y) / b.h).clamp(0.0, 1.0);
+        let dnorm = 1.0 - ((my - b.y) / b.h).clamp(0.0, 1.0); // Y up = denser
+        // Instant position for the audio thread (see Shared::pos). Store before the
+        // gate opens so the two are seen together.
+        let packed = ((nx.to_bits() as u64) << 32) | dnorm.to_bits() as u64;
+        self.shared.pos[self.track].store(packed, Ordering::Relaxed);
         self.x.set_normalized_value(cx, nx); // X = pitch
-        self.y.set_normalized_value(cx, 1.0 - ny); // Y up = denser
+        self.y.set_normalized_value(cx, dnorm);
     }
 }
 
@@ -132,12 +136,12 @@ impl View for XyPad {
         event.map(|window_event, meta| match *window_event {
             WindowEvent::MouseDown(MouseButton::Left) => {
                 self.drag = true;
-                self.shared.gate[self.track].store(true, Ordering::Relaxed);
                 cx.capture();
                 self.x.begin_set_parameter(cx);
                 self.y.begin_set_parameter(cx);
                 let (mx, my) = (cx.mouse().cursorx, cx.mouse().cursory);
-                self.apply(cx, mx, my);
+                self.apply(cx, mx, my); // writes position atomic first...
+                self.shared.gate[self.track].store(true, Ordering::Release); // ...then opens the gate
                 meta.consume();
             }
             WindowEvent::MouseMove(x, y) => {
@@ -148,7 +152,7 @@ impl View for XyPad {
             WindowEvent::MouseUp(MouseButton::Left) => {
                 if self.drag {
                     self.drag = false;
-                    self.shared.gate[self.track].store(false, Ordering::Relaxed);
+                    self.shared.gate[self.track].store(false, Ordering::Release);
                     self.x.end_set_parameter(cx);
                     self.y.end_set_parameter(cx);
                     cx.release();

@@ -6,7 +6,7 @@
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod editor;
@@ -118,6 +118,10 @@ impl Default for TrafalgarParams {
 pub(crate) struct Shared {
     /// Pad touch state per track (GUI -> audio); gates notes when Hold is off.
     pub gate: [AtomicBool; NUM_TRACKS],
+    /// Live pad position while touched: packed (x_norm << 32 | density_norm), as
+    /// f32 bits. Written before `gate` opens so the audio thread sees position and
+    /// gate together — params lag through the event queue, this doesn't.
+    pub pos: [AtomicU64; NUM_TRACKS],
     /// Current playhead step per track (audio -> GUI); -1 = idle.
     pub step: [AtomicI64; NUM_TRACKS],
 }
@@ -137,6 +141,7 @@ impl Default for Trafalgar {
             params: Arc::new(TrafalgarParams::default()),
             shared: Arc::new(Shared {
                 gate: std::array::from_fn(|_| AtomicBool::new(false)),
+                pos: std::array::from_fn(|_| AtomicU64::new(0)),
                 step: std::array::from_fn(|_| AtomicI64::new(-1)),
             }),
             last_step: [-1; NUM_TRACKS],
@@ -226,8 +231,24 @@ impl Plugin for Trafalgar {
         for tr in 0..NUM_TRACKS {
             let p = &self.params.tracks[tr];
 
+            // While the pad is touched, take pitch/density from the instant position
+            // atomic (no event-queue lag) so the first note lands at the clicked
+            // position; otherwise use the params (preserves host automation + latch).
+            let touching = self.shared.gate[tr].load(Ordering::Acquire);
+            let (pitch_deg, density) = if touching {
+                let packed = self.shared.pos[tr].load(Ordering::Relaxed);
+                let nx = f32::from_bits((packed >> 32) as u32);
+                let dnorm = f32::from_bits(packed as u32);
+                (
+                    (nx * PITCH_RANGE as f32).round().clamp(0.0, PITCH_RANGE as f32) as i32,
+                    (1.0 + dnorm * (STEPS as f32 - 1.0)).round().clamp(1.0, STEPS as f32) as usize,
+                )
+            } else {
+                (p.pitch.value(), p.density.value() as usize)
+            };
+
             // Hold on => always sound; Hold off => only while the pad is dragged.
-            let gate_open = p.hold.value() || self.shared.gate[tr].load(Ordering::Relaxed);
+            let gate_open = p.hold.value() || touching;
             if !playing || !gate_open {
                 if let Some(n) = self.playing_note[tr].take() {
                     context.send_event(NoteEvent::NoteOff { timing: 0, voice_id: None, channel: tr as u8, note: n, velocity: 0.0 });
@@ -237,7 +258,7 @@ impl Plugin for Trafalgar {
                 continue;
             }
 
-            let pattern = rotated(p.density.value() as usize, STEPS, p.rotation.value() as usize);
+            let pattern = rotated(density, STEPS, p.rotation.value() as usize);
             let accents = euclid(p.accent.value() as usize, STEPS);
 
             for s in 0..block {
@@ -258,10 +279,10 @@ impl Plugin for Trafalgar {
                 if pattern[idx] {
                     // Melodic: scale pitch, always fires. Percussive: fixed note, X = probability.
                     let (note, fire) = if p.percussive.value() {
-                        let prob = p.pitch.value() as f32 / PITCH_RANGE as f32;
+                        let prob = pitch_deg as f32 / PITCH_RANGE as f32;
                         (p.note.value() as u8, xorshift(&mut self.rng[tr]) < prob)
                     } else {
-                        (scale_note(p.pitch.value() as u8), true)
+                        (scale_note(pitch_deg as u8), true)
                     };
                     if fire {
                         let velocity = if accents[idx] { p.accent_vel.value() } else { p.base_vel.value() };
