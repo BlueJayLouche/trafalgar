@@ -1,0 +1,20 @@
+[package]
+name = "trafalgar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Euclidean jam sequencer — CLAP/VST3/standalone, MIDI + OSC out"
+
+[lib]
+# cdylib = the CLAP/VST3 plugin; lib = so the standalone bin can import the plugin.
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "trafalgar"
+path = "src/bin/standalone.rs"
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone"] }
+nih_plug_vizia = { git = "https://github.com/robbert-vdh/nih-plug.git" }

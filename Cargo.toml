@@ -1,0 +1,12 @@
+# Workspace mirrors rustjay-engine's crates/ layout. One crate today; room to split
+# (osc, sync, gui) when there's a reason. ponytail: no premature crate-splitting.
+[workspace]
+members = ["crates/trafalgar", "xtask"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+authors = ["BlueJayLouche"]
+repository = "https://github.com/BlueJayLouche/trafalgar"
