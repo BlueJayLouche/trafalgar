@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nih_plug::prelude::Editor;
+use nih_plug::prelude::{Editor, Param};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::vg;
 use nih_plug_vizia::widgets::param_base::ParamWidgetBase;
@@ -23,7 +23,7 @@ struct Data {
 impl Model for Data {}
 
 pub fn default_state() -> Arc<ViziaState> {
-    ViziaState::new(|| (680, 440))
+    ViziaState::new(|| (700, 500))
 }
 
 pub fn create(
@@ -69,13 +69,28 @@ fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared
 
         ParamButton::new(cx, Data::params, move |p| &p.tracks[i].hold);
         ParamButton::new(cx, Data::params, move |p| &p.tracks[i].percussive);
-        ParamSlider::new(cx, Data::params, move |p| &p.tracks[i].rotation);
-        ParamSlider::new(cx, Data::params, move |p| &p.tracks[i].accent);
-        ParamSlider::new(cx, Data::params, move |p| &p.tracks[i].base_vel);
-        ParamSlider::new(cx, Data::params, move |p| &p.tracks[i].note);
+        slider_row(cx, "Rot", move |p| &p.tracks[i].rotation);
+        slider_row(cx, "Accent", move |p| &p.tracks[i].accent);
+        slider_row(cx, "Vel", move |p| &p.tracks[i].base_vel);
+        slider_row(cx, "Acc lvl", move |p| &p.tracks[i].accent_vel);
+        slider_row(cx, "Note", move |p| &p.tracks[i].note);
     })
     .width(Pixels(160.0))
     .row_between(Pixels(3.0));
+}
+
+/// A labelled slider row: a short name on the left, the slider filling the rest.
+fn slider_row<P, F>(cx: &mut Context, label: &'static str, f: F)
+where
+    P: Param + 'static,
+    F: Fn(&Arc<TrafalgarParams>) -> &P + Copy + 'static,
+{
+    HStack::new(cx, |cx| {
+        Label::new(cx, label).width(Pixels(46.0)).font_size(11.0);
+        ParamSlider::new(cx, Data::params, f);
+    })
+    .col_between(Pixels(4.0))
+    .height(Auto);
 }
 
 /// Two-parameter performance pad for one track. X drives pitch, Y drives density.
