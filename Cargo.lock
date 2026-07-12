@@ -3626,6 +3626,7 @@ dependencies = [
  "nih_plug",
  "nih_plug_vizia",
  "rosc",
+ "serde",
 ]
 
 [[package]]

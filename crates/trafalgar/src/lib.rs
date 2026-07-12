@@ -5,9 +5,10 @@
 
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
+use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, RwLock};
 
 mod editor;
 mod osc;
@@ -15,9 +16,47 @@ mod osc;
 pub(crate) const STEPS: usize = 16;
 pub(crate) const NUM_TRACKS: usize = 4;
 pub(crate) const MAX_BARS: usize = 8; // longest recordable gesture loop
-const BASE_NOTE: u8 = 48; // C3
 pub(crate) const PITCH_RANGE: i32 = 15; // scale degrees the pitch param spans
-const PENTATONIC: [u8; 5] = [0, 3, 5, 7, 10]; // minor pentatonic
+
+/// Selectable scales. Semitone offsets returned by `steps()`; note count varies
+/// per scale (that's the "note steps" — 5 for pentatonic, 7 for the modes, 12
+/// chromatic), so the same pitch range spans more or fewer octaves per scale.
+#[derive(Enum, PartialEq, Clone, Copy)]
+pub enum Scale {
+    #[id = "minpent"]
+    #[name = "Min Pent"]
+    MinorPentatonic,
+    #[id = "majpent"]
+    #[name = "Maj Pent"]
+    MajorPentatonic,
+    #[id = "major"]
+    Major,
+    #[id = "minor"]
+    Minor,
+    #[id = "dorian"]
+    Dorian,
+    #[id = "chromatic"]
+    Chromatic,
+}
+
+impl Scale {
+    fn steps(self) -> &'static [u8] {
+        match self {
+            Scale::MinorPentatonic => &[0, 3, 5, 7, 10],
+            Scale::MajorPentatonic => &[0, 2, 4, 7, 9],
+            Scale::Major => &[0, 2, 4, 5, 7, 9, 11],
+            Scale::Minor => &[0, 2, 3, 5, 7, 8, 10],
+            Scale::Dorian => &[0, 2, 3, 5, 7, 9, 10],
+            Scale::Chromatic => &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        }
+    }
+}
+
+/// Human-readable MIDI note, e.g. 36 -> "36/C2" (scientific pitch, C4 = 60).
+fn note_name(v: i32) -> String {
+    const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    format!("{}/{}{}", v, NAMES[v.rem_euclid(12) as usize], v.div_euclid(12) - 1)
+}
 
 /// Bjorklund (Bresenham form): `pulses` onsets spread evenly over `steps`,
 /// onset on step 0. `(i*pulses) % steps < pulses`.
@@ -49,11 +88,39 @@ fn xorshift(state: &mut u64) -> f32 {
     (x >> 40) as f32 / (1u64 << 24) as f32
 }
 
-/// Map a scale degree onto a MIDI note in the minor pentatonic.
-fn scale_note(degree: u8) -> u8 {
-    let oct = (degree / PENTATONIC.len() as u8) as i32;
-    let step = PENTATONIC[(degree as usize) % PENTATONIC.len()];
-    (BASE_NOTE as i32 + 12 * oct + step as i32).clamp(0, 127) as u8
+/// Map a scale degree onto a MIDI note in `scale`, rooted at `base`.
+fn scale_note(base: u8, scale: Scale, degree: u8) -> u8 {
+    let steps = scale.steps();
+    let oct = (degree as usize / steps.len()) as i32;
+    let step = steps[degree as usize % steps.len()];
+    (base as i32 + 12 * oct + step as i32).clamp(0, 127) as u8
+}
+
+/// OSC output target, editable from the standalone settings popout and persisted
+/// with the plugin state.
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct OscSettings {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    /// OSC *input* (remote pad control). Opt-in; the port is the instance's identity.
+    pub in_enabled: bool,
+    pub in_port: u16,
+    /// true → bind 0.0.0.0 (reachable from the phone on the LAN); false → loopback only.
+    pub in_lan: bool,
+}
+
+impl Default for OscSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: "127.0.0.1".into(),
+            port: 9000,
+            in_enabled: false,
+            in_port: 9100,
+            in_lan: true,
+        }
+    }
 }
 
 /// One euclidean voice.
@@ -77,14 +144,25 @@ pub(crate) struct TrackParams {
     /// Percussive: fixed drum note, X axis = hit probability. Melodic: X = scale pitch.
     #[id = "perc"]
     pub percussive: BoolParam,
+    /// Percussive: the drum note. Melodic: the base (root) note the scale sits on.
     #[id = "note"]
     pub note: IntParam,
+    #[id = "scale"]
+    pub scale: EnumParam<Scale>,
     /// Armed: touching the pad writes the pitch into the loop at the playhead.
     #[id = "record"]
     pub record: BoolParam,
     /// Gesture loop length in bars (the euclidean rhythm still repeats every bar).
     #[id = "length"]
     pub length: IntParam,
+    /// Note length as a fraction of one step (gate time). Ignored when portamento
+    /// is on (that forces full-length legato so the synth can glide).
+    #[id = "notelen"]
+    pub note_len: FloatParam,
+    /// Legato + MIDI portamento (CC 65): trigger the next note before releasing the
+    /// current one and hold notes full-length, so a mono synth glides between pitches.
+    #[id = "porta"]
+    pub portamento: BoolParam,
 }
 
 impl Default for TrackParams {
@@ -98,9 +176,13 @@ impl Default for TrackParams {
             accent_vel: FloatParam::new("Accent Level", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 }),
             hold: BoolParam::new("Hold", true),
             percussive: BoolParam::new("Percussive", false),
-            note: IntParam::new("Drum Note", 36, IntRange::Linear { min: 0, max: 127 }),
+            note: IntParam::new("Note", 36, IntRange::Linear { min: 0, max: 127 })
+                .with_value_to_string(Arc::new(note_name)),
+            scale: EnumParam::new("Scale", Scale::MinorPentatonic),
             record: BoolParam::new("Record", false),
             length: IntParam::new("Bars", 1, IntRange::Linear { min: 1, max: MAX_BARS as i32 }),
+            note_len: FloatParam::new("Note Len", 1.0, FloatRange::Linear { min: 0.05, max: 1.0 }),
+            portamento: BoolParam::new("Porta", false),
         }
     }
 }
@@ -112,6 +194,9 @@ struct TrafalgarParams {
 
     #[persist = "editor-state"]
     editor_state: Arc<ViziaState>,
+
+    #[persist = "osc"]
+    osc: Arc<RwLock<OscSettings>>,
 }
 
 impl Default for TrafalgarParams {
@@ -119,6 +204,7 @@ impl Default for TrafalgarParams {
         Self {
             tracks: std::array::from_fn(|_| TrackParams::default()),
             editor_state: editor::default_state(),
+            osc: Arc::new(RwLock::new(OscSettings::default())),
         }
     }
 }
@@ -139,6 +225,14 @@ pub(crate) struct Shared {
     pub gesture: [[AtomicI32; STEPS * MAX_BARS]; NUM_TRACKS],
     /// Momentary erase (GUI -> audio): true only while the Erase button is held.
     pub erase: [AtomicBool; NUM_TRACKS],
+    /// Set by the settings popout when OSC config changes; the audio thread
+    /// rebuilds the sender on the next process block and clears it.
+    pub osc_dirty: AtomicBool,
+    /// Same, for the OSC *input* receiver.
+    pub osc_in_dirty: AtomicBool,
+    /// OSC-in bind state for the settings-panel status line: 0 off, 1 listening,
+    /// 2 bind failed (port in use). Written by the audio thread on rebuild.
+    pub osc_in_status: AtomicU8,
 }
 
 pub struct Trafalgar {
@@ -146,8 +240,12 @@ pub struct Trafalgar {
     shared: Arc<Shared>,
     last_step: [i64; NUM_TRACKS],
     playing_note: [Option<u8>; NUM_TRACKS],
+    /// Absolute sample at which the current note should release (note-length gate).
+    /// i64::MAX = no pending release (held until the next onset, e.g. portamento).
+    note_off_at: [i64; NUM_TRACKS],
     rng: [u64; NUM_TRACKS],
     osc: Option<osc::OscSender>,
+    osc_in: Option<osc::OscReceiver>,
 }
 
 impl Default for Trafalgar {
@@ -160,13 +258,18 @@ impl Default for Trafalgar {
                 step: std::array::from_fn(|_| AtomicI64::new(-1)),
                 gesture: std::array::from_fn(|_| std::array::from_fn(|_| AtomicI32::new(-1))),
                 erase: std::array::from_fn(|_| AtomicBool::new(false)),
+                osc_dirty: AtomicBool::new(true), // build the sender on first process
+                osc_in_dirty: AtomicBool::new(true), // build the receiver on first process
+                osc_in_status: AtomicU8::new(0),
             }),
             last_step: [-1; NUM_TRACKS],
             playing_note: [None; NUM_TRACKS],
+            note_off_at: [i64::MAX; NUM_TRACKS],
             rng: std::array::from_fn(|i| {
                 0x9E37_79B9_7F4A_7C15u64.wrapping_add((i as u64).wrapping_mul(0x1234_5678_9ABC_DEF1))
             }),
             osc: None,
+            osc_in: None,
         }
     }
 }
@@ -207,15 +310,17 @@ impl Plugin for Trafalgar {
         _buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        if self.osc.is_none() {
-            self.osc = osc::OscSender::new();
-        }
+        // Sender/receiver are (re)built lazily in process() whenever their dirty
+        // flags are set; start dirty so the first block opens them from settings.
+        self.shared.osc_dirty.store(true, Ordering::Relaxed);
+        self.shared.osc_in_dirty.store(true, Ordering::Relaxed);
         true
     }
 
     fn reset(&mut self) {
         self.last_step = [-1; NUM_TRACKS];
         self.playing_note = [None; NUM_TRACKS];
+        self.note_off_at = [i64::MAX; NUM_TRACKS];
     }
 
     fn process(
@@ -229,6 +334,28 @@ impl Plugin for Trafalgar {
             ch.fill(0.0);
         }
 
+        // Rebuild the OSC sender if the settings popout changed the target. ponytail:
+        // binds a socket + spawns a thread here, but only on the rare config change —
+        // move to a BackgroundTask if it ever shows up as an xrun.
+        if self.shared.osc_dirty.swap(false, Ordering::Relaxed) {
+            let cfg = self.params.osc.read().unwrap().clone();
+            self.osc = cfg.enabled.then(|| osc::OscSender::new(&cfg.host, cfg.port)).flatten();
+        }
+        // Same for the OSC-in receiver; also publish the bind status for the GUI.
+        if self.shared.osc_in_dirty.swap(false, Ordering::Relaxed) {
+            let cfg = self.params.osc.read().unwrap().clone();
+            self.osc_in = cfg
+                .in_enabled
+                .then(|| osc::OscReceiver::new(self.shared.clone(), cfg.in_lan, cfg.in_port))
+                .flatten();
+            let status = match (cfg.in_enabled, self.osc_in.is_some()) {
+                (false, _) => 0,
+                (true, true) => 1,
+                (true, false) => 2, // enabled but bind failed → port in use
+            };
+            self.shared.osc_in_status.store(status, Ordering::Relaxed);
+        }
+
         let t = context.transport();
         let sr = t.sample_rate as f64;
         let block = buffer.samples();
@@ -238,6 +365,7 @@ impl Plugin for Trafalgar {
                 if let Some(n) = self.playing_note[tr].take() {
                     context.send_event(NoteEvent::NoteOff { timing: 0, voice_id: None, channel: tr as u8, note: n, velocity: 0.0 });
                 }
+                self.note_off_at[tr] = i64::MAX;
                 self.shared.step[tr].store(-1, Ordering::Relaxed);
             }
             return ProcessStatus::Normal;
@@ -278,6 +406,7 @@ impl Plugin for Trafalgar {
                 if let Some(n) = self.playing_note[tr].take() {
                     context.send_event(NoteEvent::NoteOff { timing: 0, voice_id: None, channel: tr as u8, note: n, velocity: 0.0 });
                 }
+                self.note_off_at[tr] = i64::MAX;
                 self.last_step[tr] = -1;
                 self.shared.step[tr].store(-1, Ordering::Relaxed);
                 continue;
@@ -285,20 +414,27 @@ impl Plugin for Trafalgar {
 
             let pattern = rotated(density, STEPS, p.rotation.value() as usize);
             let accents = euclid(p.accent.value() as usize, STEPS);
+            let porta = p.portamento.value();
+            let note_len = p.note_len.value();
 
             for s in 0..block {
                 let global = pos + s as i64;
+
+                // Staccato release: fire the note-length gate when its sample arrives.
+                // (Skipped under portamento, which holds full-length for legato glide.)
+                if global >= self.note_off_at[tr] {
+                    if let Some(n) = self.playing_note[tr].take() {
+                        context.send_event(NoteEvent::NoteOff { timing: s as u32, voice_id: None, channel: tr as u8, note: n, velocity: 0.0 });
+                    }
+                    self.note_off_at[tr] = i64::MAX;
+                }
+
                 let stp = (global as f64 / samples_per_step).floor() as i64;
                 if stp == self.last_step[tr] {
                     continue;
                 }
                 self.last_step[tr] = stp;
                 let timing = s as u32;
-
-                // note-off the previous note at the step boundary (monophonic per track)
-                if let Some(n) = self.playing_note[tr].take() {
-                    context.send_event(NoteEvent::NoteOff { timing, voice_id: None, channel: tr as u8, note: n, velocity: 0.0 });
-                }
 
                 let idx = stp.rem_euclid(STEPS as i64) as usize; // euclidean pattern (per bar)
                 let gidx = stp.rem_euclid(loop_steps as i64) as usize; // gesture loop position
@@ -318,7 +454,7 @@ impl Plugin for Trafalgar {
                         let prob = pitch_deg as f32 / PITCH_RANGE as f32;
                         (xorshift(rng) < prob).then(|| p.note.value() as u8)
                     } else {
-                        Some(scale_note(pitch_deg as u8))
+                        Some(scale_note(p.note.value() as u8, p.scale.value(), pitch_deg as u8))
                     }
                 };
 
@@ -341,11 +477,35 @@ impl Plugin for Trafalgar {
 
                 if let Some(note) = emit {
                     let velocity = if accents[idx] { p.accent_vel.value() } else { p.base_vel.value() };
-                    context.send_event(NoteEvent::NoteOn { timing, voice_id: None, channel: tr as u8, note, velocity });
+                    // Keep the synth's portamento in sync with the toggle (CC 65).
+                    context.send_event(NoteEvent::MidiCC { timing, channel: tr as u8, cc: 65, value: if porta { 1.0 } else { 0.0 } });
+
+                    if porta {
+                        // Legato: sound the new note before releasing the old so a mono
+                        // synth glides instead of retriggering. Hold full-length.
+                        context.send_event(NoteEvent::NoteOn { timing, voice_id: None, channel: tr as u8, note, velocity });
+                        if let Some(prev) = self.playing_note[tr].take() {
+                            context.send_event(NoteEvent::NoteOff { timing, voice_id: None, channel: tr as u8, note: prev, velocity: 0.0 });
+                        }
+                        self.note_off_at[tr] = i64::MAX;
+                    } else {
+                        if let Some(prev) = self.playing_note[tr].take() {
+                            context.send_event(NoteEvent::NoteOff { timing, voice_id: None, channel: tr as u8, note: prev, velocity: 0.0 });
+                        }
+                        context.send_event(NoteEvent::NoteOn { timing, voice_id: None, channel: tr as u8, note, velocity });
+                        // Release this note after note_len of the step.
+                        self.note_off_at[tr] = ((stp as f64 + note_len as f64) * samples_per_step) as i64;
+                    }
                     if let Some(o) = &self.osc {
                         o.note(tr as u8, note, velocity);
                     }
                     self.playing_note[tr] = Some(note);
+                } else if !porta {
+                    // A rest step with no portamento: release any held note at the boundary.
+                    if let Some(prev) = self.playing_note[tr].take() {
+                        context.send_event(NoteEvent::NoteOff { timing, voice_id: None, channel: tr as u8, note: prev, velocity: 0.0 });
+                    }
+                    self.note_off_at[tr] = i64::MAX;
                 }
             }
 
@@ -402,8 +562,17 @@ mod tests {
     }
     #[test]
     fn pitch_in_range() {
-        for d in 0..=PITCH_RANGE as u8 {
-            assert!(scale_note(d) <= 127);
+        for scale in [Scale::MinorPentatonic, Scale::Major, Scale::Dorian, Scale::Chromatic] {
+            for d in 0..=PITCH_RANGE as u8 {
+                assert!(scale_note(60, scale, d) <= 127);
+            }
         }
+    }
+    #[test]
+    fn note_names() {
+        assert_eq!(note_name(36), "36/C2");
+        assert_eq!(note_name(60), "60/C4");
+        assert_eq!(note_name(0), "0/C-1");
+        assert_eq!(note_name(69), "69/A4");
     }
 }

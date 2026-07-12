@@ -20,3 +20,4 @@ nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["s
 nih_plug_vizia = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 rosc = "0.11"
 cpal = "0.15"
+serde = { version = "1", features = ["derive"] }
