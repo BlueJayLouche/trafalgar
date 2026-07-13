@@ -220,16 +220,20 @@ mod tests {
     }
 
     fn test_shared() -> Arc<Shared> {
-        use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, AtomicU8};
+        use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicU8};
         Arc::new(Shared {
             gate: std::array::from_fn(|_| AtomicBool::new(false)),
             pos: std::array::from_fn(|_| AtomicU64::new(0)),
             step: std::array::from_fn(|_| AtomicI64::new(-1)),
-            gesture: std::array::from_fn(|_| std::array::from_fn(|_| AtomicI32::new(-1))),
+            gesture: crate::Gesture::default(),
             erase: std::array::from_fn(|_| AtomicBool::new(false)),
             osc_dirty: AtomicBool::new(false),
             osc_in_dirty: AtomicBool::new(false),
             osc_in_status: AtomicU8::new(0),
+            midi_dirty: AtomicBool::new(false),
+            midi_status: AtomicU8::new(0),
+            link_dirty: AtomicBool::new(false),
+            link_peers: AtomicU32::new(0),
         })
     }
 
