@@ -16,7 +16,7 @@ use nih_plug_vizia::widgets::param_base::ParamWidgetBase;
 use nih_plug_vizia::widgets::{ParamButton, ParamSlider};
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 
-use crate::{euclid, rotated, OscSettings, Shared, TrafalgarParams, NUM_TRACKS, PITCH_RANGE, STEPS};
+use crate::{euclid, midi, rotated, MidiSettings, OscSettings, Shared, TrafalgarParams, NUM_TRACKS, PITCH_RANGE, STEPS};
 
 #[derive(Lens)]
 struct Data {
@@ -25,11 +25,17 @@ struct Data {
     /// Mirror of `shared.osc_in_status`, refreshed by the redraw timer so the
     /// settings panel can show a live bind status (0 off, 1 listening, 2 failed).
     osc_in_status: u8,
+    /// Mirror of `shared.midi_status` (0 off, 1 connected, 2 failed).
+    midi_status: u8,
+    /// Mirror of `shared.link_peers` — live Ableton Link peer count.
+    link_peers: u32,
 }
 
 enum AppEvent {
     ToggleSettings,
     SetOscInStatus(u8),
+    SetMidiStatus(u8),
+    SetLinkPeers(u32),
 }
 
 impl Model for Data {
@@ -37,6 +43,8 @@ impl Model for Data {
         event.map(|e, _| match e {
             AppEvent::ToggleSettings => self.settings_open = !self.settings_open,
             AppEvent::SetOscInStatus(s) => self.osc_in_status = *s,
+            AppEvent::SetMidiStatus(s) => self.midi_status = *s,
+            AppEvent::SetLinkPeers(p) => self.link_peers = *p,
         });
     }
 }
@@ -48,6 +56,10 @@ struct SettingsData {
     #[lens(ignore)]
     settings: Arc<std::sync::RwLock<OscSettings>>,
     #[lens(ignore)]
+    midi: Arc<std::sync::RwLock<MidiSettings>>,
+    #[lens(ignore)]
+    link: Arc<std::sync::RwLock<bool>>,
+    #[lens(ignore)]
     shared: Arc<Shared>,
     enabled: bool,
     host: String,
@@ -55,6 +67,10 @@ struct SettingsData {
     in_enabled: bool,
     in_port: String,
     in_lan: bool,
+    midi_enabled: bool,
+    midi_port: String,
+    midi_virtual: bool,
+    link_enabled: bool,
 }
 
 enum SettingsEvent {
@@ -64,14 +80,20 @@ enum SettingsEvent {
     ToggleInEnabled,
     SetInPort(String),
     ToggleInLan,
+    ToggleMidi,
+    SetMidiPort(String),
+    ToggleMidiVirtual,
+    ToggleLink,
 }
 
 impl Model for SettingsData {
     fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
         event.map(|e, _| {
-            // Which side changed — so we only rebuild the affected socket.
+            // Which side changed — so we only rebuild the affected socket/port.
             let mut out_changed = false;
             let mut in_changed = false;
+            let mut midi_changed = false;
+            let mut link_changed = false;
             match e {
                 SettingsEvent::ToggleEnabled => { self.enabled = !self.enabled; out_changed = true; }
                 SettingsEvent::SetHost(h) => { self.host = h.clone(); out_changed = true; }
@@ -79,6 +101,11 @@ impl Model for SettingsData {
                 SettingsEvent::ToggleInEnabled => { self.in_enabled = !self.in_enabled; in_changed = true; }
                 SettingsEvent::SetInPort(p) => { self.in_port = p.clone(); in_changed = true; }
                 SettingsEvent::ToggleInLan => { self.in_lan = !self.in_lan; in_changed = true; }
+                // Picking a port also enables output (one click connects).
+                SettingsEvent::SetMidiPort(p) => { self.midi_port = p.clone(); self.midi_enabled = true; self.midi_virtual = false; midi_changed = true; }
+                SettingsEvent::ToggleMidi => { self.midi_enabled = !self.midi_enabled; midi_changed = true; }
+                SettingsEvent::ToggleMidiVirtual => { self.midi_virtual = !self.midi_virtual; self.midi_enabled |= self.midi_virtual; midi_changed = true; }
+                SettingsEvent::ToggleLink => { self.link_enabled = !self.link_enabled; link_changed = true; }
             }
             let mut s = self.settings.write().unwrap();
             s.enabled = self.enabled;
@@ -92,6 +119,18 @@ impl Model for SettingsData {
                 s.in_port = p;
             }
             drop(s);
+            if midi_changed {
+                let mut m = self.midi.write().unwrap();
+                m.enabled = self.midi_enabled;
+                m.port = self.midi_port.clone();
+                m.virtual_port = self.midi_virtual;
+                drop(m);
+                self.shared.midi_dirty.store(true, Ordering::Relaxed);
+            }
+            if link_changed {
+                *self.link.write().unwrap() = self.link_enabled;
+                self.shared.link_dirty.store(true, Ordering::Relaxed);
+            }
             if out_changed {
                 self.shared.osc_dirty.store(true, Ordering::Relaxed);
             }
@@ -130,7 +169,7 @@ pub fn create(
 ) -> Option<Box<dyn Editor>> {
     create_vizia_editor(state, ViziaTheming::Custom, move |cx, _| {
         assets::register_noto_sans_light(cx);
-        Data { params: params.clone(), settings_open: false, osc_in_status: 0 }.build(cx);
+        Data { params: params.clone(), settings_open: false, osc_in_status: 0, midi_status: 0, link_peers: 0 }.build(cx);
 
         // Undo history lives here, shared among this build's widgets (GUI thread).
         let undo: UndoStack = Rc::new(RefCell::new(Vec::new()));
@@ -139,12 +178,24 @@ pub fn create(
         // bind status (set on the audio thread) and push it to the model on change.
         let status_shared = shared.clone();
         let last_status = Cell::new(u8::MAX);
+        let last_midi = Cell::new(u8::MAX);
+        let last_peers = Cell::new(u32::MAX);
         let timer = cx.add_timer(Duration::from_millis(33), None, move |cx, action| {
             if matches!(action, TimerAction::Tick(_)) {
                 let s = status_shared.osc_in_status.load(Ordering::Relaxed);
                 if s != last_status.get() {
                     last_status.set(s);
                     cx.emit(AppEvent::SetOscInStatus(s));
+                }
+                let m = status_shared.midi_status.load(Ordering::Relaxed);
+                if m != last_midi.get() {
+                    last_midi.set(m);
+                    cx.emit(AppEvent::SetMidiStatus(m));
+                }
+                let p = status_shared.link_peers.load(Ordering::Relaxed);
+                if p != last_peers.get() {
+                    last_peers.set(p);
+                    cx.emit(AppEvent::SetLinkPeers(p));
                 }
                 cx.needs_redraw();
             }
@@ -192,6 +243,21 @@ fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared
             .width(Stretch(1.0))
             .height(Pixels(150.0));
 
+        // Axis caption: X switches Pitch/Prob with the melodic/percussive mode (live
+        // via make_lens); Y is always Density. Y grows upward on the pad.
+        HStack::new(cx, |cx| {
+            Label::new(
+                cx,
+                ParamWidgetBase::make_lens(Data::params, move |p| &p.tracks[i].percussive, |perc| {
+                    if perc.value() { "X: Prob".to_string() } else { "X: Pitch".to_string() }
+                }),
+            )
+            .font_size(9.0);
+            Label::new(cx, "Y: Density").font_size(9.0);
+        })
+        .col_between(Pixels(10.0))
+        .height(Auto);
+
         HStack::new(cx, |cx| {
             ParamButton::new(cx, Data::params, move |p| &p.tracks[i].hold);
             ParamButton::new(cx, Data::params, move |p| &p.tracks[i].percussive);
@@ -229,6 +295,7 @@ fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared
         slider_row(cx, "Vel", move |p| &p.tracks[i].base_vel);
         slider_row(cx, "Acc lvl", move |p| &p.tracks[i].accent_vel);
         slider_row(cx, "Note", move |p| &p.tracks[i].note);
+        slider_row(cx, "MIDI Ch", move |p| &p.tracks[i].channel);
     })
     .width(Pixels(185.0))
     .row_between(Pixels(3.0));
@@ -238,9 +305,15 @@ fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared
 /// the persisted `OscSettings` and flag the audio thread to rebuild the sender.
 fn settings_panel(cx: &mut Context, params: Arc<TrafalgarParams>, shared: Arc<Shared>) {
     let cfg = params.osc.read().unwrap().clone();
+    let mcfg = params.midi.read().unwrap().clone();
+    let link_on = *params.link.read().unwrap();
+    // Enumerated once when the panel opens; reopen the panel to rescan for new ports.
+    let ports = midi::output_ports();
     VStack::new(cx, |cx| {
         SettingsData {
             settings: params.osc.clone(),
+            midi: params.midi.clone(),
+            link: params.link.clone(),
             shared,
             enabled: cfg.enabled,
             host: cfg.host,
@@ -248,12 +321,17 @@ fn settings_panel(cx: &mut Context, params: Arc<TrafalgarParams>, shared: Arc<Sh
             in_enabled: cfg.in_enabled,
             in_port: cfg.in_port.to_string(),
             in_lan: cfg.in_lan,
+            midi_enabled: mcfg.enabled,
+            midi_port: mcfg.port,
+            midi_virtual: mcfg.virtual_port,
+            link_enabled: link_on,
         }
         .build(cx);
 
         Label::new(cx, "SETTINGS").font_size(16.0);
 
-        Label::new(cx, "OSC output").font_size(11.0).top(Pixels(6.0));
+        Label::new(cx, "OSC output").font_size(11.0).top(Pixels(6.0))
+            .tooltip(|cx| { Label::new(cx, "Sends per note:\n/fig/track/{n}/note  [note, velocity]"); });
         HStack::new(cx, |cx| {
             Checkbox::new(cx, SettingsData::enabled).on_toggle(|cx| cx.emit(SettingsEvent::ToggleEnabled));
             Label::new(cx, "Enabled").hoverable(false);
@@ -263,7 +341,10 @@ fn settings_panel(cx: &mut Context, params: Arc<TrafalgarParams>, shared: Arc<Sh
         settings_field(cx, "Host", SettingsData::host, |cx, t, _| cx.emit(SettingsEvent::SetHost(t)));
         settings_field(cx, "Port", SettingsData::port, |cx, t, _| cx.emit(SettingsEvent::SetPort(t)));
 
-        Label::new(cx, "OSC input (remote pad)").font_size(11.0).top(Pixels(10.0));
+        Label::new(cx, "OSC input (remote pad)").font_size(11.0).top(Pixels(10.0))
+            .tooltip(|cx| {
+                Label::new(cx, "Listens ({n} = 0-3):\n/track/{n}/xy     [x, y]\n/track/{n}/gate   [0|1]\n/track/{n}/erase  [0|1]\n/track/{n}/clear  [1]");
+            });
         HStack::new(cx, |cx| {
             Checkbox::new(cx, SettingsData::in_enabled).on_toggle(|cx| cx.emit(SettingsEvent::ToggleInEnabled));
             Label::new(cx, "Enabled").hoverable(false);
@@ -288,9 +369,60 @@ fn settings_panel(cx: &mut Context, params: Arc<TrafalgarParams>, shared: Arc<Sh
             Label::new(cx, text).font_size(10.0).color(col);
         });
 
-        Label::new(cx, "MIDI").font_size(11.0).top(Pixels(10.0));
-        Label::new(cx, "Output goes to the host / virtual port. Input and device\nare chosen at launch (--midi-input / --midi-output).")
-            .font_size(10.0);
+        Label::new(cx, "MIDI output").font_size(11.0).top(Pixels(10.0));
+        Label::new(cx, "Also sent to the host. Pick a port to send directly to a\nsynth/hardware (works in any host, changeable live).").font_size(10.0);
+        HStack::new(cx, |cx| {
+            Checkbox::new(cx, SettingsData::midi_enabled).on_toggle(|cx| cx.emit(SettingsEvent::ToggleMidi));
+            Label::new(cx, "Enabled").hoverable(false);
+        })
+        .col_between(Pixels(6.0))
+        .height(Auto);
+        HStack::new(cx, |cx| {
+            Checkbox::new(cx, SettingsData::midi_virtual).on_toggle(|cx| cx.emit(SettingsEvent::ToggleMidiVirtual));
+            Label::new(cx, "Create virtual port \"Trafalgar\" (macOS/Linux)").hoverable(false);
+        })
+        .col_between(Pixels(6.0))
+        .height(Auto);
+        // Port list: click one to connect. Selected port shown bold.
+        for name in &ports {
+            let n = name.clone();
+            Binding::new(cx, SettingsData::midi_port, move |cx, sel| {
+                let selected = sel.get(cx) == n;
+                let n2 = n.clone();
+                Button::new(cx, move |cx| cx.emit(SettingsEvent::SetMidiPort(n2.clone())), |cx| {
+                    Label::new(cx, &if selected { format!("● {n}") } else { format!("○ {n}") }).hoverable(false)
+                })
+                .height(Pixels(20.0))
+                .width(Stretch(1.0));
+            });
+        }
+        // Live connection status from the audio thread (0 off, 1 connected, 2 failed).
+        Binding::new(cx, Data::midi_status, |cx, s| {
+            let (text, col) = match s.get(cx) {
+                1 => ("connected", Color::rgb(20, 130, 60)),
+                2 => ("port unavailable", Color::rgb(190, 40, 30)),
+                _ => ("off", Color::rgb(120, 120, 120)),
+            };
+            Label::new(cx, text).font_size(10.0).color(col);
+        });
+
+        Label::new(cx, "Ableton Link").font_size(11.0).top(Pixels(10.0));
+        Label::new(cx, "Sync tempo + bar phase to Link peers on the network.").font_size(10.0);
+        HStack::new(cx, |cx| {
+            Checkbox::new(cx, SettingsData::link_enabled).on_toggle(|cx| cx.emit(SettingsEvent::ToggleLink));
+            Label::new(cx, "Enabled").hoverable(false);
+        })
+        .col_between(Pixels(6.0))
+        .height(Auto);
+        Binding::new(cx, SettingsData::link_enabled, |cx, on| {
+            if on.get(cx) {
+                Binding::new(cx, Data::link_peers, |cx, p| {
+                    Label::new(cx, &format!("{} peer(s)", p.get(cx))).font_size(10.0).color(Color::rgb(20, 130, 60));
+                });
+            } else {
+                Label::new(cx, "off").font_size(10.0).color(Color::rgb(120, 120, 120));
+            }
+        });
 
         Button::new(cx, |cx| cx.emit(AppEvent::ToggleSettings), |cx| Label::new(cx, "Close"))
             .top(Pixels(12.0))
