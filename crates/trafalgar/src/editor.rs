@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nih_plug::prelude::{Editor, Param};
+use nih_plug::prelude::{Editor, GuiContext, Param, PluginState};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::vg;
 use nih_plug_vizia::widgets::param_base::ParamWidgetBase;
@@ -167,7 +167,7 @@ pub fn create(
     shared: Arc<Shared>,
     state: Arc<ViziaState>,
 ) -> Option<Box<dyn Editor>> {
-    create_vizia_editor(state, ViziaTheming::Custom, move |cx, _| {
+    create_vizia_editor(state, ViziaTheming::Custom, move |cx, gui_context| {
         assets::register_noto_sans_light(cx);
         Data { params: params.clone(), settings_open: false, osc_in_status: 0, midi_status: 0, link_peers: 0 }.build(cx);
 
@@ -206,6 +206,14 @@ pub fn create(
             HStack::new(cx, |cx| {
                 Label::new(cx, "TRAFALGAR").font_size(22.0);
                 UndoButton::new(cx, shared.clone(), undo.clone());
+                // Save/Load the whole project (params + patterns + settings) to a JSON
+                // file. Mainly for the standalone, which otherwise loses everything on
+                // quit; harmless in a host (an export/import of the plugin state).
+                let gc = gui_context.clone();
+                Button::new(cx, move |_| save_project(gc.clone()), |cx| Label::new(cx, "Save")).height(Pixels(22.0));
+                let gc = gui_context.clone();
+                let sh = shared.clone();
+                Button::new(cx, move |_| load_project(gc.clone(), sh.clone()), |cx| Label::new(cx, "Load")).height(Pixels(22.0));
                 Button::new(cx, |cx| cx.emit(AppEvent::ToggleSettings), |cx| Label::new(cx, "Settings"))
                     .height(Pixels(22.0));
             })
@@ -232,6 +240,45 @@ pub fn create(
             }
         });
     })
+}
+
+// Save/Load run on a spawned thread with rfd's *async* dialog, not the blocking one.
+// The blocking dialog runs a nested modal loop that re-enters baseview's event
+// handling while vizia still holds a RefCell borrow → "RefCell already borrowed"
+// panic. The async dialog opens as a sheet (completion callback on the main run
+// loop), so the click handler returns immediately and the borrow is released. All
+// the work after the dialog (get/set_state, file IO) is thread-safe.
+
+/// Write the full plugin state (params + persisted patterns/settings) to a JSON file.
+/// A cancelled dialog or unwritable path simply does nothing.
+fn save_project(gc: Arc<dyn GuiContext>) {
+    std::thread::spawn(move || {
+        let dialog = rfd::AsyncFileDialog::new()
+            .add_filter("Trafalgar project", &["json"])
+            .set_file_name("project.json")
+            .save_file();
+        let Some(handle) = pollster::block_on(dialog) else { return };
+        if let Ok(json) = serde_json::to_string_pretty(&gc.get_state()) {
+            let _ = std::fs::write(handle.path(), json);
+        }
+    });
+}
+
+/// Load a project JSON and apply it. `set_state` round-trips through the audio thread
+/// and returns only once applied, so afterwards we flag the OSC/MIDI/Link sockets
+/// dirty to rebuild them from the just-loaded settings.
+fn load_project(gc: Arc<dyn GuiContext>, shared: Arc<Shared>) {
+    std::thread::spawn(move || {
+        let dialog = rfd::AsyncFileDialog::new().add_filter("Trafalgar project", &["json"]).pick_file();
+        let Some(handle) = pollster::block_on(dialog) else { return };
+        let Ok(json) = std::fs::read_to_string(handle.path()) else { return };
+        let Ok(state) = serde_json::from_str::<PluginState>(&json) else { return };
+        gc.set_state(state);
+        shared.osc_dirty.store(true, Ordering::Relaxed);
+        shared.osc_in_dirty.store(true, Ordering::Relaxed);
+        shared.midi_dirty.store(true, Ordering::Relaxed);
+        shared.link_dirty.store(true, Ordering::Relaxed);
+    });
 }
 
 fn track_column(cx: &mut Context, i: usize, params: Arc<TrafalgarParams>, shared: Arc<Shared>, undo: UndoStack) {
